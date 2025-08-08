@@ -22,9 +22,6 @@ extension ImageListRoute {
 
             let images = try await client.list()
 
-            // print the number of images for debugging
-            print("Images are", images)
-
             var imagesSummaries: [RESTImageSummary] = []
 
             // for each images, grab the details and print
@@ -52,10 +49,6 @@ extension ImageListRoute {
                         continue
                     }
 
-                    let os = platform.os
-                    let arch = platform.architecture
-                    let variant = platform.variant ?? ""
-
                     var config: ContainerizationOCI.Image
                     var manifest: ContainerizationOCI.Manifest
 
@@ -74,8 +67,6 @@ extension ImageListRoute {
                     // need to convert it to a Unix timestamp (number of seconds since EPOCH).
                     let createdIso8601 = config.created ?? "1970-01-01T00:00:00Z"  // Default to epoch if not available
 
-                    print("      ----> config   is", config)
-
                     let iso8601Formatter = ISO8601DateFormatter()
                     iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                     var formattedDate = iso8601Formatter.date(from: createdIso8601)
@@ -88,23 +79,13 @@ extension ImageListRoute {
 
                     // Use guard to ensure we now have a valid date
                     guard let date = formattedDate else {
-                        print("Failed to parse date: \(createdIso8601)")
                         continue  // or return, depending on context
                     }
-
-                    print("--- - - --  -- - -  - parsedDate is", date)
-
                     let unixTimestamp = date.timeIntervalSince1970
                     let created = Int(unixTimestamp)
                     let size = descriptor.size + manifest.config.size + manifest.layers.reduce(0, { (l, r) in l + r.size })
 
-                    print("       -| | | |size for image  \(size)")
-
-                    let data = try JSONEncoder().encode(details)
-                    let decoder = JSONDecoder()
-                    let detail = try decoder.decode(CustomImageDetail.self, from: data)
-
-                    let name = detail.name
+                    let name = details.name
 
                     let summary = RESTImageSummary(
                         Id: image.digest,

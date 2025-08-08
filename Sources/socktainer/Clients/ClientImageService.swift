@@ -17,11 +17,6 @@ struct ClientImageService: ClientImageProtocol {
             !Utility.isInfraImage(name: img.reference)
         }
 
-        // display the content of foo
-        for image in filteredImages {
-            print("---> ClientImageService.list: Image: \(image)")
-        }
-
         return filteredImages
     }
 

@@ -20,9 +20,6 @@ extension ContainerListRoute {
             let query = try req.query.decode(ContainerListQuery.self)
             let showAll = query.all ?? false
 
-            // print the showAll value for debugging
-            print("Show all containers: \(showAll)")
-
             let containers = try await client.list(showAll: showAll)
 
             return containers.map {

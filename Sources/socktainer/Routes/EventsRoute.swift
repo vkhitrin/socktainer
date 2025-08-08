@@ -36,41 +36,8 @@ extension EventsRoute {
                 }
             })
 
-            /*
-                response.body = .init(stream: { writer in
-                    // Simulate streaming Docker events every second
-                    req.eventLoop.scheduleRepeatedTask(initialDelay: .zero, delay: .seconds(1)) { task in
-                        let event = generateFakeDockerEvent()
-                        if let json = try? JSONEncoder().encode(event) {
-                            var buffer = req.application.allocator.buffer(capacity: json.count + 1)
-                            buffer.writeBytes(json)
-                            buffer.writeString("\n")
-                            writer.write(.buffer(buffer))
-                        }
-                    }
-            
-                    // No return needed — just let it stream indefinitely
-                })*/
-
             return response
 
         }
     }
 }
-
-/*
-func generateFakeDockerEvent() -> DockerEvent {
-    DockerEvent(
-        status: "start",
-        id: UUID().uuidString.prefix(12).description,
-        from: "swift:vapor",
-        time: Int(Date().timeIntervalSince1970)
-    )
-}
-
-struct DockerEvent: Content {
-    let status: String
-    let id: String
-    let from: String
-    let time: Int
-}*/

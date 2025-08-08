@@ -25,7 +25,6 @@ extension ImageDeleteRoute {
             }
 
             let imageRef = parts.joined(separator: "/")
-            print("ask to delete image with reference: \(imageRef)")
             try await client.delete(id: imageRef)
 
             // Optional: broadcast event

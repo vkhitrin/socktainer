@@ -16,7 +16,6 @@ extension ContainerStopRoute {
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
-            print("Stopping container with ID: \(id)")
             try await client.stop(id: id)
 
             let broadcaster = req.application.storage[EventBroadcasterKey.self]!

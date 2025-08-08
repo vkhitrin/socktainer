@@ -35,9 +35,7 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func stop(id: String) async throws {
-        print("Stopping container with ID: \(id)")
         let container = try await ClientContainer.list().filter { $0.id == id }.first
-        print("Found container \(container?.id ?? "nil")")
         guard let container else {
             throw ClientContainerError.notFound(id: id)
         }
