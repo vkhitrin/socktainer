@@ -7,7 +7,7 @@ let package = Package(
         .macOS(.v15)
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/container.git", from : "0.2.0"),
+        .package(url: "https://github.com/apple/container.git", from: "0.2.0"),
         .package(url: "https://github.com/vapor/vapor.git", from: "4.115.0"),
     ],
     targets: [
@@ -17,8 +17,12 @@ let package = Package(
                 .product(name: "ContainerClient", package: "container"),
                 .product(name: "Vapor", package: "vapor"),
             ]
-        )
+        ),
+        .testTarget(
+            name: "socktainerTests",
+            dependencies: ["socktainer"]
+        ),
+
     ]
+
 )
-
-
