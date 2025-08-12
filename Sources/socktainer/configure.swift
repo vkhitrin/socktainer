@@ -25,5 +25,17 @@ func configure(_ app: Application) async throws {
     // /volumes
     try app.register(collection: VolumeListRoute())
 
-    app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+    // Initialize broadcaster
+    let broadcaster = EventBroadcaster()
+    app.storage[EventBroadcasterKey.self] = broadcaster
+
+    let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
+    let parentFolderURL = URL(fileURLWithPath: folderPath)
+
+    let watcher = FolderWatcher(parentFolderURL: parentFolderURL, broadcaster: broadcaster)
+    app.storage[FolderWatcherKey.self] = watcher
+
+    // Await starting watching
+    watcher.startWatching()
+
 }
