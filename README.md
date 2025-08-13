@@ -1,9 +1,5 @@
 ## Socktainer
 
-### Install swift 6.2
-
-using siwftly: `swiftly install 6.2-snapshot`
-
 ### Install xcode 26 beta
 
 ```
