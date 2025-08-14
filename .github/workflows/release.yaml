@@ -155,7 +155,6 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --wait
-           xcrun stapler staple ./.build/arm64-apple-macosx/release/socktainer
            spctl -a -vv ./.build/arm64-apple-macosx/release/socktainer
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
