@@ -87,14 +87,12 @@ jobs:
         with:
           ref: ${{ needs.tag.outputs.githubTag}}
 
-      - name: Set macOS environment variables
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          echo "CSC_LINK=${{secrets.CSC_LINK}}" >> $GITHUB_ENV
-          echo "CSC_KEY_PASSWORD=${{secrets.CSC_KEY_PASSWORD}}" >> $GITHUB_ENV
-          echo "APPLE_ID=${{secrets.APPLE_ID}}" >> $GITHUB_ENV
-          echo "APPLE_APP_SPECIFIC_PASSWORD=${{secrets.APPLE_APP_SPECIFIC_PASSWORD}}" >> $GITHUB_ENV
-          echo "APPLE_TEAM_ID=${{secrets.APPLE_TEAM_ID}}" >> $GITHUB_ENV
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
 
       - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
         with:
@@ -144,14 +142,21 @@ jobs:
             --options runtime \
             --entitlements entitlements.plist \
             ./.build/arm64-apple-macosx/release/socktainer
+    
+      - name: zip the binary
+        run: |
+          cd ./.build/arm64-apple-macosx/release/
+          zip -r socktainer.zip socktainer
 
       - name: Submit for notarization
         run: |
-          xcrun notarytool submit ./.build/arm64-apple-macosx/release/socktainer \
+          xcrun notarytool submit ./.build/arm64-apple-macosx/release/socktainer.zip \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --wait
+           xcrun stapler staple ./.build/arm64-apple-macosx/release/socktainer
+           spctl -a -vv ./.build/arm64-apple-macosx/release/socktainer
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
