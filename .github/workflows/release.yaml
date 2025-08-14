@@ -161,14 +161,10 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: socktainer
-          path: ./.build/arm64-apple-macosx/release/socktainer
-
       - name: Upload socktainer binary
         run: |
          gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
+         gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
 
 
   release:
