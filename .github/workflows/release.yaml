@@ -118,6 +118,45 @@ jobs:
       - name: List Build
         run: ls -la ./.build/arm64-apple-macosx/release/
 
+
+      - name: Decode .p12 certificate
+        run: |
+          echo "$CERTIFICATE_P12_BASE64" | base64 --decode > signing_cert.p12
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.CERTIFICATE_P12_BASE64 }}
+
+      - name: Import cert into temporary keychain
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "" "$KEYCHAIN"
+          security import signing_cert.p12 -k "$KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
+        env:
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+
+      - name: Sign binary
+        run: |
+          codesign --force \
+            --sign "${{ secrets.APPLE_APPLICATION_ID}}" \
+            --options runtime \
+            --entitlements entitlements.plist \
+            ./.build/arm64-apple-macosx/release/socktainer
+
+      - name: Submit for notarization
+        run: |
+          xcrun notarytool submit ./.build/arm64-apple-macosx/release/socktainer \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --wait
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: socktainer
