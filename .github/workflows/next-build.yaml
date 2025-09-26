@@ -163,6 +163,8 @@ jobs:
         run: |
          gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
          gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
 
   release:
     needs: [tag, build]
