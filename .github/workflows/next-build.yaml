@@ -161,10 +161,8 @@ jobs:
 
       - name: Upload socktainer binary
         run: |
-         gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
-         gh release upload ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
-
-
+         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
+         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
 
   release:
     needs: [tag, build]
@@ -177,7 +175,7 @@ jobs:
       - name: Publish release
         uses: StuYarrow/publish-release@01f2a1365bacd77bad861873a7fdf274ab49eefd # v1.1.2
         env:
-          GITHUB_TOKEN: ${{ secrets.PODMAN_DESKTOP_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
         with:
           id: ${{ needs.tag.outputs.releaseId}}
           repo: prereleases
