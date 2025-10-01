@@ -137,7 +137,7 @@ extension RESTNetworkSummary {
         let id: String
         let driver: String
         let options: [String: String] = [:]  // Not provided by Apple container
-        let labels: [String: String] = [:]  // Not provided by Apple container
+        var labels: [String: String] = [:]  // Not provided by Apple container
         var subnet: String? = nil
         var gateway: String? = nil
 
@@ -152,6 +152,10 @@ extension RESTNetworkSummary {
             subnet = config.subnet ?? status.address
             gateway = status.gateway
         }
+
+        // NOTE: Workaround for docker compose, create a label that matches the network name
+        let dockerComposeNetworkLabel = id.contains("_") ? String(id.split(separator: "_").last!) : ""
+        labels = ["com.docker.compose.network": dockerComposeNetworkLabel]
 
         self.init(
             Name: id,
