@@ -12,6 +12,7 @@ NOTARIZE_USERNAME ?=
 NOTARIZE_PASSWORD ?=
 NOTARIZE_TEAM ?=
 INSTALL_PREFIX ?= /opt/socktainer
+SIGNING_KEYCHAIN ?=
 
 # Directory structure
 BUILD_DIR := build
@@ -116,11 +117,21 @@ sign-pkg: product-pkg
 		echo "✅ Unsigned installer created: $(OUT_DIR)/$(PKG_NAME)"; \
 	else \
 		echo "Signing installer package..."; \
-		echo "Available signing identities:"; \
-		security find-identity -p codesigning -v; \
-		productsign --timestamp --sign "$(APPLE_PRODUCT_ID)" \
-			$(OUT_DIR)/socktainer-unsigned.pkg \
-			$(OUT_DIR)/$(PKG_NAME); \
+		if [ -n "$(SIGNING_KEYCHAIN)" ]; then \
+			echo "Using keychain: $(SIGNING_KEYCHAIN)"; \
+			echo "Available signing identities in keychain:"; \
+			security find-identity -p codesigning -v "$(SIGNING_KEYCHAIN)"; \
+			productsign --timestamp --sign "$(APPLE_PRODUCT_ID)" \
+				--keychain "$(SIGNING_KEYCHAIN)" \
+				$(OUT_DIR)/socktainer-unsigned.pkg \
+				$(OUT_DIR)/$(PKG_NAME); \
+		else \
+			echo "Available signing identities:"; \
+			security find-identity -p codesigning -v; \
+			productsign --timestamp --sign "$(APPLE_PRODUCT_ID)" \
+				$(OUT_DIR)/socktainer-unsigned.pkg \
+				$(OUT_DIR)/$(PKG_NAME); \
+		fi; \
 		rm $(OUT_DIR)/socktainer-unsigned.pkg; \
 		echo "✅ Signed installer created: $(OUT_DIR)/$(PKG_NAME)"; \
 	fi

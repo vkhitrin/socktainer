@@ -176,8 +176,8 @@ jobs:
           # List available identities again to debug
           echo "Available signing identities for installer:"
           security find-identity -p codesigning -v "$SIGNING_KEYCHAIN"
-          
-          make installer-notarized
+
+          SIGNING_KEYCHAIN="$SIGNING_KEYCHAIN" make installer-notarized
         env:
           BUILD_VERSION: ${{ needs.tag.outputs.socktainerVersion}}
           APPLE_APPLICATION_ID: ${{ secrets.APPLE_APPLICATION_ID}}
