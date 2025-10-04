@@ -93,7 +93,7 @@ installer-signed: release
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-signed
 
 .PHONY: installer-notarized
-installer-notarized: release
+installer-notarized: 
 	@$(MAKE) -C pkginstaller BUILD_VERSION="$(BUILD_VERSION)" installer-notarized
 
 .PHONY: installer-help
