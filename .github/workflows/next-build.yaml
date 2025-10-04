@@ -160,7 +160,7 @@ jobs:
 
       - name: Create & sign the installer
         run: |
-          cd pkginstaller && make notarize
+          make installer-notarized
         env:
           BUILD_VERSION: ${{ needs.tag.outputs.socktainerVersion}}
           APPLE_APPLICATION_ID: ${{ secrets.APPLE_APPLICATION_ID}}
