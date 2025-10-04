@@ -94,7 +94,7 @@ sign-binary: copy-binary
 component-pkg: sign-binary scripts
 	@echo "Creating component package..."
 	@pkgbuild --root $(PACKAGE_ROOT) \
-		--identifier com.socktainer.socktainer \
+		--identifier io.github.socktainer \
 		--version $(BUILD_VERSION) \
 		--install-location / \
 		--scripts $(SCRIPTS_DIR) \
@@ -116,6 +116,8 @@ sign-pkg: product-pkg
 		echo "✅ Unsigned installer created: $(OUT_DIR)/$(PKG_NAME)"; \
 	else \
 		echo "Signing installer package..."; \
+		echo "Available signing identities:"; \
+		security find-identity -p codesigning -v; \
 		productsign --timestamp --sign "$(APPLE_PRODUCT_ID)" \
 			$(OUT_DIR)/socktainer-unsigned.pkg \
 			$(OUT_DIR)/$(PKG_NAME); \

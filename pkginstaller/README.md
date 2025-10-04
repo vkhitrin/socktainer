@@ -40,5 +40,5 @@ Creates `out/socktainer-installer.pkg` that:
 ```bash
 sudo rm -rf /opt/socktainer
 sudo rm -f /etc/paths.d/socktainer
-sudo pkgutil --forget com.socktainer.socktainer
+sudo pkgutil --forget io.github.socktainer
 ```
