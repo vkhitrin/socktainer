@@ -60,7 +60,6 @@ let package = Package(
                 .define("APPLE_CONTAINER_VERSION", to: "\"\(appleContainerVersion)\""),
             ]
         ),
-
     ]
 
 )
