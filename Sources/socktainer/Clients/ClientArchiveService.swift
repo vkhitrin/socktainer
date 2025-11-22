@@ -93,7 +93,7 @@ protocol ClientArchiveProtocol: Sendable {
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarData: Data, noOverwriteDirNonDir: Bool) async throws
+    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
 }
 
 /// Service for performing archive operations on container filesystems
@@ -160,7 +160,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
         try extractPathToDirectory(reader: reader, sourcePath: normalizedPath, destDir: stagingDir)
 
         // Create tar archive from the staging directory
-        try TarUtility.create(tarPath: tarPath, from: stagingDir)
+        try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
 
         // Read the tar data
         let tarData = try Data(contentsOf: tarPath)
@@ -169,7 +169,7 @@ struct ClientArchiveService: ClientArchiveProtocol {
     }
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarData: Data, noOverwriteDirNonDir: Bool) async throws {
+    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
         let rootfsPath = getRootfsPath(containerId: containerId)
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
@@ -179,158 +179,37 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
 
-        // Try optimized in-place modification first
-        // This is O(tar size) instead of O(filesystem size)
-        if let success = try? await putArchiveOptimized(
-            rootfsPath: rootfsPath,
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+        try validateArchiveEntries(
+            reader: reader,
+            tarPath: tarPath,
             destinationPath: normalizedPath,
-            tarData: tarData
-        ), success {
-            return
-        }
+            noOverwriteDirNonDir: noOverwriteDirNonDir
+        )
 
-        // Fall back to full read-modify-write approach
         try await putArchiveFallback(
             rootfsPath: rootfsPath,
             destinationPath: normalizedPath,
-            tarData: tarData
+            inputTarPath: tarPath
         )
-    }
-
-    /// Optimized PUT using EXT4Editor for in-place modification
-    /// Returns true if successful, false if fallback is needed
-    private func putArchiveOptimized(
-        rootfsPath: URL,
-        destinationPath: String,
-        tarData: Data
-    ) async throws -> Bool {
-        // Extract tar to temp directory first to examine contents
-        let tempDir = FileManager.default.temporaryDirectory
-        let sessionId = UUID().uuidString
-        let extractDir = tempDir.appendingPathComponent("\(sessionId)-extract")
-
-        defer {
-            try? FileManager.default.removeItem(at: extractDir)
-        }
-
-        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true)
-
-        // Write tar and extract it
-        let tarPath = tempDir.appendingPathComponent("\(sessionId).tar")
-        defer { try? FileManager.default.removeItem(at: tarPath) }
-        try tarData.write(to: tarPath)
-
-        // Extract tar to temp directory
-        try TarUtility.extract(tarPath: tarPath, to: extractDir)
-
-        // Open EXT4Editor
-        let editor = try EXT4Editor(devicePath: FilePath(rootfsPath.path))
-
-        // Process extracted files
-        let success = try processExtractedFiles(
-            editor: editor,
-            extractDir: extractDir,
-            basePath: extractDir.path,
-            destinationPath: destinationPath
-        )
-
-        if success {
-            try editor.sync()
-        }
-
-        return success
-    }
-
-    /// Recursively process extracted files and add them to the filesystem
-    private func processExtractedFiles(
-        editor: EXT4Editor,
-        extractDir: URL,
-        basePath: String,
-        destinationPath: String
-    ) throws -> Bool {
-        let fileManager = FileManager.default
-        let contents = try fileManager.contentsOfDirectory(
-            at: extractDir,
-            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
-        )
-
-        for itemURL in contents {
-            let relativePath = String(itemURL.path.dropFirst(basePath.count))
-            let fullDestPath =
-                destinationPath == "/"
-                ? relativePath
-                : destinationPath + relativePath
-
-            let resourceValues = try itemURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            let isDirectory = resourceValues.isDirectory ?? false
-            let isSymlink = resourceValues.isSymbolicLink ?? false
-
-            if isSymlink {
-                // Handle symlink
-                let target = try fileManager.destinationOfSymbolicLink(atPath: itemURL.path)
-                if editor.exists(path: fullDestPath) {
-                    // Can't overwrite with EXT4Editor, fall back
-                    return false
-                }
-                try editor.addSymlink(path: fullDestPath, target: target)
-            } else if isDirectory {
-                // Handle directory
-                if !editor.exists(path: fullDestPath) {
-                    try editor.createDirectory(path: fullDestPath)
-                }
-                // Recursively process contents
-                let success = try processExtractedFiles(
-                    editor: editor,
-                    extractDir: itemURL,
-                    basePath: basePath,
-                    destinationPath: destinationPath
-                )
-                if !success {
-                    return false
-                }
-            } else {
-                // Handle regular file
-                if editor.exists(path: fullDestPath) {
-                    // Can't overwrite with EXT4Editor, fall back
-                    return false
-                }
-
-                let fileData = try Data(contentsOf: itemURL)
-                let attributes = try fileManager.attributesOfItem(atPath: itemURL.path)
-                let posixPermissions = (attributes[.posixPermissions] as? UInt16) ?? 0o644
-
-                try editor.addFile(
-                    path: fullDestPath,
-                    data: fileData,
-                    mode: posixPermissions
-                )
-            }
-        }
-
-        return true
     }
 
     /// Fallback PUT using full read-modify-write approach
     private func putArchiveFallback(
         rootfsPath: URL,
         destinationPath: String,
-        tarData: Data
+        inputTarPath: URL
     ) async throws {
         // Create temporary files for the operation
         let tempDir = FileManager.default.temporaryDirectory
         let sessionId = UUID().uuidString
         let exportedTarPath = tempDir.appendingPathComponent("\(sessionId)-export.tar")
-        let inputTarPath = tempDir.appendingPathComponent("\(sessionId)-input.tar")
         let newRootfsPath = tempDir.appendingPathComponent("\(sessionId)-rootfs.ext4")
 
         defer {
             try? FileManager.default.removeItem(at: exportedTarPath)
-            try? FileManager.default.removeItem(at: inputTarPath)
             try? FileManager.default.removeItem(at: newRootfsPath)
         }
-
-        // Write the input tar data to a temporary file
-        try tarData.write(to: inputTarPath)
 
         // Step 1: Export existing filesystem to tar
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
@@ -358,7 +237,11 @@ struct ClientArchiveService: ClientArchiveProtocol {
         try formatter.unpack(reader: existingReader)
 
         // Step 5: Unpack the new tar at the specified destination path
-        try unpackTarToPath(formatter: formatter, tarPath: inputTarPath, destinationPath: destinationPath)
+        try ArchiveUtility.unpack(
+            tarPath: inputTarPath,
+            to: formatter,
+            destinationPath: destinationPath
+        )
 
         // Step 6: Finalize the new filesystem
         try formatter.close()
@@ -390,21 +273,56 @@ struct ClientArchiveService: ClientArchiveProtocol {
         return String(data: data, encoding: .utf8)
     }
 
+    private func validateArchiveEntries(
+        reader: EXT4.EXT4Reader,
+        tarPath: URL,
+        destinationPath: String,
+        noOverwriteDirNonDir: Bool
+    ) throws {
+        let archiveReader = try ArchiveReader(
+            format: .paxRestricted,
+            filter: .none,
+            file: tarPath
+        )
+
+        for (entry, _) in archiveReader.makeStreamingIterator() {
+            guard let fullPath = ArchiveUtility.destinationPath(for: entry.path, under: destinationPath) else {
+                continue
+            }
+
+            guard noOverwriteDirNonDir, reader.exists(FilePath(fullPath)) else {
+                continue
+            }
+
+            let (_, inode) = try reader.stat(FilePath(fullPath))
+            let existingIsDirectory = inode.isDirectory
+            let incomingIsDirectory = entry.fileType == .directory
+
+            if existingIsDirectory != incomingIsDirectory {
+                throw ClientArchiveError.operationFailed(
+                    message: "Refusing to overwrite \(existingIsDirectory ? "directory" : "non-directory") at \(fullPath)"
+                )
+            }
+        }
+    }
+
     /// Extract a path from the ext4 filesystem to a local directory
     private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
         let (_, inode) = try reader.stat(FilePath(sourcePath))
-        let baseName = (sourcePath as NSString).lastPathComponent
+        let baseName = sourcePath == "/" ? nil : (sourcePath as NSString).lastPathComponent
 
         if inode.isDirectory {
-            // Create the directory
-            let dirDest = destDir.appendingPathComponent(baseName)
-            try FileManager.default.createDirectory(at: dirDest, withIntermediateDirectories: true)
-
-            // Set permissions
-            try FileManager.default.setAttributes(
-                [.posixPermissions: NSNumber(value: inode.permissions)],
-                ofItemAtPath: dirDest.path
-            )
+            let dirDest: URL
+            if let baseName {
+                dirDest = destDir.appendingPathComponent(baseName)
+                try FileManager.default.createDirectory(at: dirDest, withIntermediateDirectories: true)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: NSNumber(value: inode.permissions)],
+                    ofItemAtPath: dirDest.path
+                )
+            } else {
+                dirDest = destDir
+            }
 
             // Recursively extract contents
             let entries = try reader.listDirectory(FilePath(sourcePath))
@@ -415,6 +333,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         } else if inode.isRegularFile {
             // Read file contents
             let fileData = try reader.readFile(at: FilePath(sourcePath))
+            guard let baseName else {
+                throw ClientArchiveError.invalidPath(path: sourcePath)
+            }
             let fileDest = destDir.appendingPathComponent(baseName)
 
             // Write file
@@ -432,6 +353,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
         } else if inode.isSymlink {
             // Read symlink target
             if let target = readSymlinkTarget(reader: reader, path: sourcePath) {
+                guard let baseName else {
+                    throw ClientArchiveError.invalidPath(path: sourcePath)
+                }
                 let linkDest = destDir.appendingPathComponent(baseName)
                 try FileManager.default.createSymbolicLink(atPath: linkDest.path, withDestinationPath: target)
             }
@@ -439,84 +363,4 @@ struct ClientArchiveService: ClientArchiveProtocol {
         // Skip other file types (devices, fifos, sockets)
     }
 
-    private func unpackTarToPath(formatter: EXT4.Formatter, tarPath: URL, destinationPath: String) throws {
-        let archiveReader = try ArchiveReader(
-            format: .paxRestricted,
-            filter: .none,
-            file: tarPath
-        )
-
-        // Reusable buffer for file content
-        let bufferSize = 128 * 1024
-        let reusableBuffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: bufferSize)
-        defer { reusableBuffer.deallocate() }
-
-        for (entry, streamReader) in archiveReader.makeStreamingIterator() {
-            guard var entryPath = entry.path else {
-                continue
-            }
-
-            // Normalize the entry path
-            if entryPath.hasPrefix("./") {
-                entryPath = String(entryPath.dropFirst(1))
-            }
-            if !entryPath.hasPrefix("/") {
-                entryPath = "/" + entryPath
-            }
-
-            // Construct the full destination path
-            let fullPath: String
-            if destinationPath == "/" {
-                fullPath = entryPath
-            } else {
-                fullPath = destinationPath + entryPath
-            }
-
-            let filePath = FilePath(fullPath)
-            let ts = FileTimestamps(
-                access: entry.contentAccessDate,
-                modification: entry.modificationDate,
-                creation: entry.creationDate
-            )
-
-            switch entry.fileType {
-            case .directory:
-                try formatter.create(
-                    path: filePath,
-                    mode: EXT4.Inode.Mode(.S_IFDIR, entry.permissions),
-                    ts: ts,
-                    uid: entry.owner,
-                    gid: entry.group,
-                    xattrs: entry.xattrs
-                )
-            case .regular:
-                try formatter.create(
-                    path: filePath,
-                    mode: EXT4.Inode.Mode(.S_IFREG, entry.permissions),
-                    ts: ts,
-                    buf: streamReader,
-                    uid: entry.owner,
-                    gid: entry.group,
-                    xattrs: entry.xattrs,
-                    fileBuffer: reusableBuffer
-                )
-            case .symbolicLink:
-                var symlinkTarget: FilePath?
-                if let target = entry.symlinkTarget {
-                    symlinkTarget = FilePath(target)
-                }
-                try formatter.create(
-                    path: filePath,
-                    link: symlinkTarget,
-                    mode: EXT4.Inode.Mode(.S_IFLNK, entry.permissions),
-                    ts: ts,
-                    uid: entry.owner,
-                    gid: entry.group,
-                    xattrs: entry.xattrs
-                )
-            default:
-                continue
-            }
-        }
-    }
 }
