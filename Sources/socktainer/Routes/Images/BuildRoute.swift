@@ -13,9 +13,15 @@ import Vapor
 struct BuildRoute: RouteCollection {
 
     let client: ClientContainerProtocol
+    let builderClient: ClientBuilderProtocol
+
+    init(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) {
+        self.client = client
+        self.builderClient = builderClient
+    }
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/build", use: BuildRoute.handler(client: client, builderClient: builderClient))
 
     }
 
@@ -62,7 +68,7 @@ struct RESTBuildQuery: Vapor.Content {
 }
 
 extension BuildRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+    static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             var query = try req.query.decode(RESTBuildQuery.self)
 
@@ -86,6 +92,16 @@ extension BuildRoute {
             let target = query.target!
             let platform = query.platform!
             let memory = query.memory ?? 2_048_000_000  // 2GB default
+
+            do {
+                try await builderClient.ensureReachable(
+                    timeout: .seconds(3),
+                    retryInterval: .milliseconds(250),
+                    logger: req.logger
+                )
+            } catch {
+                throw Abort(.serviceUnavailable, reason: "BuildKit builder is not running or reachable: \(error.localizedDescription)")
+            }
 
             // Extract tar archive from request body and unpack to temporary directory
             let contextDir: String
@@ -161,8 +177,6 @@ extension BuildRoute {
                         } catch {
                             req.logger.error("Tar extraction failed: \(error)")
 
-                            let timestamp = Int(Date().timeIntervalSince1970)
-
                             throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
                         }
                         contextDir = extractDir.path
@@ -209,6 +223,7 @@ extension BuildRoute {
                             platform: platform,
                             memory: memory,
                             quiet: quiet,
+                            builderClient: builderClient,
                             writer: writer,
                             logger: req.logger
                         )
@@ -283,6 +298,7 @@ extension BuildRoute {
         platform: String,
         memory: Int,
         quiet: Bool,
+        builderClient: ClientBuilderProtocol,
         writer: BodyStreamWriter,
         logger: Logger
     ) async throws {
@@ -329,43 +345,12 @@ extension BuildRoute {
 
         sendStreamMessage(" ---> Connecting to build daemon")
 
-        // Connect to builder (similar to BuildCommand logic)
-        let builder: Builder? = try await withThrowingTaskGroup(of: Builder.self) { group in
-            defer {
-                group.cancelAll()
-            }
-
-            group.addTask {
-                while true {
-                    do {
-                        let container = try await ContainerClient().get(id: "buildkit")
-                        let fh = try await ContainerClient().dial(id: container.id, port: 8088)  // Default vsock port
-
-                        let threadGroup: MultiThreadedEventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-                        let b = try Builder(socket: fh, group: threadGroup)
-
-                        // If this call succeeds, then BuildKit is running.
-                        let _ = try await b.info()
-                        sendStreamMessage(" ---> Successfully connected to builder")
-                        return b
-                    } catch {
-                        // Builder not available - throw error
-                        throw ContainerizationError(.unknown, message: "BuildKit container is not running. Please start the builder first.")
-                    }
-                }
-            }
-
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw ContainerizationError(.timeout, message: "Timeout waiting for connection to builder")
-            }
-
-            return try await group.next()
-        }
-
-        guard let builder else {
-            throw ContainerizationError(.unknown, message: "builder is not running")
-        }
+        let builder = try await builderClient.connect(
+            timeout: timeout,
+            retryInterval: .seconds(1),
+            logger: logger
+        )
+        sendStreamMessage(" ---> Successfully connected to builder")
 
         // resolve the full path to the Dockerfile
         sendStreamMessage(" ---> Reading Dockerfile")

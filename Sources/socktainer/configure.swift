@@ -17,6 +17,7 @@ func configure(_ app: Application) async throws {
     let volumeClinet = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
+    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -99,8 +100,8 @@ func configure(_ app: Application) async throws {
     try app.register(collection: NetworkDeletetRoute(client: networkClient))
 
     // --- build/distribution routes ---
-    try app.register(collection: BuildPruneRoute())
-    try app.register(collection: BuildRoute(client: containerClient))
+    try app.register(collection: BuildPruneRoute(builderClient: builderClient))
+    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient))
     try app.register(collection: DistributionJsonRoute())
 
     // --- plugin routes ---
