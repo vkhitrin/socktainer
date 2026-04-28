@@ -1,16 +1,16 @@
 import Foundation
+import NIOConcurrencyHelpers
 import Vapor
 
 extension RoutesBuilder {
-    var app: Application {
-        self as! Application
-    }
-
     func registerVersionedRoute<T: AsyncResponseEncodable & Sendable>(
         _ method: HTTPMethod,
         pattern: String,
         use closure: @escaping @Sendable (Request) async throws -> T
     ) throws {
+        guard let app = self as? Application else {
+            throw Abort(.internalServerError, reason: "Regex routes can only be registered on Application")
+        }
         try app.regexRouter.register(method, pattern: pattern, use: closure)
     }
 }
@@ -21,9 +21,17 @@ struct RegexRoute {
     let handler: @Sendable (Request, [String]) async throws -> Response
 }
 
-final class RegexRouter: @unchecked Sendable {
-    fileprivate var routes: [RegexRoute] = []
-    private var middlewareInstalled = false
+extension RegexRoute: Sendable {}
+
+final class RegexRouter: Sendable {
+    private static let parameterRegex = try? NSRegularExpression(pattern: #"\{([^:}]+)(?::[^}]*)?\}"#)
+
+    private struct State: Sendable {
+        var routes: [RegexRoute] = []
+        var middlewareInstalled = false
+    }
+
+    private let state = NIOLockedValueBox(State())
     private let logger: Logger
 
     init(logger: Logger) {
@@ -35,7 +43,7 @@ final class RegexRouter: @unchecked Sendable {
         handler: @escaping @Sendable (Request, [String]) async throws -> Response
     ) throws {
         let regex = try NSRegularExpression(pattern: pattern)
-        routes.append(RegexRoute(method: method, regex: regex, handler: handler))
+        state.withLockedValue { $0.routes.append(RegexRoute(method: method, regex: regex, handler: handler)) }
     }
 
     func register<T: AsyncResponseEncodable & Sendable>(
@@ -72,7 +80,7 @@ final class RegexRouter: @unchecked Sendable {
             return try await result.encodeResponse(for: req)
         }
 
-        routes.append(RegexRoute(method: method, regex: regex, handler: handler))
+        state.withLockedValue { $0.routes.append(RegexRoute(method: method, regex: regex, handler: handler)) }
     }
 
     private func convertMobyRoutePatternToRegex(_ pattern: String) -> (regex: String, parameterNames: [String]) {
@@ -83,7 +91,10 @@ final class RegexRouter: @unchecked Sendable {
         parameterNames.append("version")
 
         // Find all parameters like {paramName:.*} or {paramName}
-        let parameterRegex = try! NSRegularExpression(pattern: #"\{([^:}]+)(?::[^}]*)?\}"#)
+        guard let parameterRegex = Self.parameterRegex else {
+            logger.error("RegexRouter: Failed to initialize parameter regex")
+            return ("^(?:/v([0-9]+\\.[0-9]+))?" + NSRegularExpression.escapedPattern(for: pattern) + "$", parameterNames)
+        }
         let matches = parameterRegex.matches(in: pattern, range: NSRange(location: 0, length: pattern.count))
 
         // Extract parameter names in order (after version)
@@ -109,9 +120,19 @@ final class RegexRouter: @unchecked Sendable {
     }
 
     func installMiddleware(on app: Application) {
-        guard !middlewareInstalled else { return }
+        let shouldInstall = state.withLockedValue { state in
+            guard !state.middlewareInstalled else {
+                return false
+            }
+            state.middlewareInstalled = true
+            return true
+        }
+        guard shouldInstall else { return }
         app.middleware.use(RegexRoutingMiddleware(regexRouter: self))
-        middlewareInstalled = true
+    }
+
+    func routesSnapshot() -> [RegexRoute] {
+        state.withLockedValue { $0.routes }
     }
 }
 
@@ -120,10 +141,11 @@ struct RegexRoutingMiddleware: Middleware {
 
     func respond(to request: Request, chainingTo next: Responder) -> EventLoopFuture<Response> {
         let path = request.url.path
+        let routes = regexRouter.routesSnapshot()
 
-        request.logger.debug("RegexRouter: Checking path '\(path)' against \(regexRouter.routes.count) registered routes")
+        request.logger.debug("RegexRouter: Checking path '\(path)' against \(routes.count) registered routes")
 
-        for route in regexRouter.routes where route.method == request.method {
+        for route in routes where route.method == request.method {
             let range = NSRange(location: 0, length: path.utf16.count)
             request.logger.debug("RegexRouter: Testing regex pattern '\(route.regex.pattern)' against path '\(path)'")
 
@@ -156,10 +178,12 @@ private struct RegexRouterKey: StorageKey {
 
 extension Application {
     var regexRouter: RegexRouter {
-        guard let stored = self.storage[RegexRouterKey.self] else {
-            fatalError("RegexRouter must be configured with a logger. Call app.setRegexRouter() in configure.swift")
+        if let stored = self.storage[RegexRouterKey.self] {
+            return stored
         }
-        return stored
+        let router = RegexRouter(logger: self.logger)
+        self.storage[RegexRouterKey.self] = router
+        return router
     }
 
     func setRegexRouter(_ router: RegexRouter) {

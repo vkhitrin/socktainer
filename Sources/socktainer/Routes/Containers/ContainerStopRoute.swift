@@ -1,3 +1,4 @@
+import ContainerizationError
 import Vapor
 
 struct ContainerStopRoute: RouteCollection {
@@ -7,31 +8,48 @@ struct ContainerStopRoute: RouteCollection {
     }
 }
 
-struct ContainerStopQuery: Content {
-    let signal: String?
-    let t: Int?/// Number of seconds to wait before stopping the container
-}
-
 extension ContainerStopRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
+    private static func abortForStopError(_ error: any Error, id: String) -> Abort {
+        ContainerMutationRouteUtility.abort(
+            for: error,
+            containerID: id,
+            operation: "stop",
+            treatAnyClientErrorAsNotFound: true
+        )
+    }
+
+    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let id = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
 
             let query = try req.query.decode(ContainerStopQuery.self)
-            let signal = query.signal
-            let timeout = query.t
+            let signal = try ContainerSignalUtility.validatedSignal(query.signal, action: "stop")
+            let timeout = try ContainerSignalUtility.validatedTimeout(query.t, action: "stop")
 
-            try await client.stop(id: id, signal: signal, timeout: timeout)
+            guard let container = try await client.getContainer(id: id) else {
+                throw ContainerEventUtility.notFoundAbort(containerID: id)
+            }
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+            if container.status != .running {
+                return Response(status: .notModified)
+            }
 
-            let event = DockerEvent.simpleEvent(id: id, type: "container", status: "stop")
+            do {
+                try await client.stop(id: id, signal: signal, timeout: timeout)
+            } catch {
+                throw abortForStopError(error, id: id)
+            }
 
-            await broadcaster.broadcast(event)
+            await ContainerEventUtility.broadcastContainerEvent(
+                request: req,
+                status: "stop",
+                container: container,
+                containerID: id
+            )
 
-            return .noContent
+            return Response(status: .noContent)
         }
     }
 }

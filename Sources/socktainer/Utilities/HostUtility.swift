@@ -41,6 +41,18 @@ public func getKernel() -> String {
     return release
 }
 
+public func hostOpenFileDescriptorCount() -> Int? {
+    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd") else {
+        return nil
+    }
+
+    return entries.reduce(into: 0) { count, entry in
+        if Int(entry) != nil {
+            count += 1
+        }
+    }
+}
+
 func findAvailablePort() throws -> Int {
     let sock = socket(AF_INET, SOCK_STREAM, 0)
     guard sock >= 0 else {

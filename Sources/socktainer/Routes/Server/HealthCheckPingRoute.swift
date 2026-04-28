@@ -11,12 +11,14 @@ struct HealthCheckPingRoute: RouteCollection {
 extension HealthCheckPingRoute {
     private static func buildResponse(includeBody: Bool) -> Response {
         let response = Response(status: .ok)
+        response.headers.contentType = .plainText
         if includeBody {
             response.body = .init(string: "OK")
         }
         response.headers.add(name: "Api-Version", value: "1.51")
-        response.headers.add(name: "Builder-Version", value: "")
+        response.headers.add(name: "Builder-Version", value: "2")
         response.headers.add(name: "Docker-Experimental", value: "false")
+        response.headers.add(name: "Swarm", value: "inactive")
         response.headers.add(name: "Cache-Control", value: "no-cache, no-store, must-revalidate")
         response.headers.add(name: "Pragma", value: "no-cache")
         return response

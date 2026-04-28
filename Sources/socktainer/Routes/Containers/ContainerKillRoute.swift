@@ -1,9 +1,7 @@
 import ContainerAPIClient
+import ContainerResource
+import ContainerizationError
 import Vapor
-
-struct ContainerKillQuery: Content {
-    let signal: String?
-}
 
 struct ContainerKillRoute: RouteCollection {
     let client: ClientContainerService
@@ -13,6 +11,15 @@ struct ContainerKillRoute: RouteCollection {
 }
 
 extension ContainerKillRoute {
+    private static func abortForKillError(_ error: any Error, containerId: String) -> Abort {
+        ContainerMutationRouteUtility.abort(
+            for: error,
+            containerID: containerId,
+            operation: "kill",
+            notRunningReason: "Container \(containerId) is not running"
+        )
+    }
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
 
@@ -22,18 +29,21 @@ extension ContainerKillRoute {
                 throw Abort(.badRequest, reason: "Container ID is required")
             }
 
-            let signal = query.signal ?? nil
+            let signal = try ContainerSignalUtility.validatedSignal(query.signal, action: "kill")
+            let container = try await client.getContainer(id: containerId)
 
             do {
                 try await client.kill(id: containerId, signal: signal)
+                await ContainerEventUtility.broadcastContainerEvent(
+                    request: req,
+                    status: "kill",
+                    container: container,
+                    containerID: containerId
+                )
                 return Response(status: .noContent)
-            } catch ClientContainerError.notFound {
-                return Response(status: .notFound, body: .init(string: "container \(containerId) not found"))
-            } catch ClientContainerError.notRunning {
-                return Response(status: .conflict, body: .init(string: "container \(containerId) is not running"))
             } catch {
                 req.logger.error("Failed to kill container \(containerId): \(error)")
-                return Response(status: .internalServerError, body: .init(string: "Failed to kill container: \(error)"))
+                throw abortForKillError(error, containerId: containerId)
             }
         }
     }

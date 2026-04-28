@@ -1,3 +1,4 @@
+import ContainerResource
 import Vapor
 
 struct ContainerStartRoute: RouteCollection {
@@ -7,13 +8,8 @@ struct ContainerStartRoute: RouteCollection {
     }
 }
 
-struct ContainerStartQuery: Content {
-    /// Override the key sequence for detaching a container
-    let detachKeys: String?
-}
-
 extension ContainerStartRoute {
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
+    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
 
             guard let id = req.parameters.get("id") else {
@@ -22,22 +18,66 @@ extension ContainerStartRoute {
 
             let query = try req.query.decode(ContainerStartQuery.self)
             let detachKeys = query.detachKeys
+            let attachSessionManager = req.application.storage[StoppedContainerAttachSessionManagerKey.self]
+            let startedSessionManager = req.application.storage[StartedContainerSessionManagerKey.self]
+            var eventContainer: ContainerSnapshot?
 
             do {
                 guard let container = try await client.getContainer(id: id) else {
-                    throw Abort(.notFound, reason: "No such container: \(id)")
+                    if let attachSessionManager {
+                        let hasPreparedAttachSession = await attachSessionManager.session(containerID: id) != nil
+                        let hasCompletedAttachSession = await attachSessionManager.completion(containerID: id) != nil
+                        let hasPreparedOrCompletedAttachSession = hasPreparedAttachSession || hasCompletedAttachSession
+                        if hasPreparedOrCompletedAttachSession {
+                            req.logger.debug("Container \(id) already ran through a prepared attached session")
+                            return Response(status: .noContent)
+                        }
+                    }
+                    throw ContainerEventUtility.notFoundAbort(containerID: id)
                 }
+                eventContainer = container
 
                 // If container is already running, return success (Docker CLI behavior)
                 if container.status == .running {
                     req.logger.debug("Container \(id) is already running")
+                    return Response(status: .notModified)
                 } else {
-                    // Try to start the container
-                    try await client.start(id: id, detachKeys: detachKeys)
+                    let hasPreparedAttachSession =
+                        if let attachSessionManager {
+                            await attachSessionManager.session(containerID: container.id) != nil
+                        } else {
+                            false
+                        }
+
+                    // NOTE: When a stopped-container attach session was prepared
+                    // earlier, socktainer starts that Apple-backed session here
+                    // instead of going through a separate Docker daemon attach/start
+                    // choreography. The observable behavior is close, but not a
+                    // literal implementation of Moby's internal flow.
+                    if hasPreparedAttachSession, let detachKeys, !detachKeys.isEmpty {
+                        req.logger.debug("Ignoring custom start detachKeys '\(detachKeys)' for prepared attached session \(id)")
+                    }
+
+                    if let attachSessionManager, try await attachSessionManager.start(containerID: container.id) {
+                        req.logger.debug("Started attached container session \(id)")
+                    } else {
+                        try await client.start(
+                            id: id,
+                            detachKeys: detachKeys,
+                            startedSessionManager: startedSessionManager
+                        )
+                    }
                     req.logger.debug("Started container \(id)")
                 }
 
             } catch {
+                if let abort = error as? Abort {
+                    throw abort
+                }
+                if let abort = error as? AbortError {
+                    throw Abort(abort.status, reason: abort.reason)
+                }
+
                 // Check if error indicates container is already running/bootstrapped
                 let errorMessage = error.localizedDescription
                 let isAlreadyRunning =
@@ -51,14 +91,14 @@ extension ContainerStartRoute {
                 req.logger.debug("Container \(id) was already running or bootstrapped")
             }
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+            await ContainerEventUtility.broadcastContainerEvent(
+                request: req,
+                status: "start",
+                container: eventContainer,
+                containerID: id
+            )
 
-            let event = DockerEvent.simpleEvent(id: id, type: "container", status: "start")
-
-            await broadcaster.broadcast(event)
-
-            // should return 204 HTTP code
-            return .noContent
+            return Response(status: .noContent)
         }
     }
 }

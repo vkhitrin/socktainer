@@ -10,6 +10,7 @@ private enum EXT4Constants {
     static let rootInode: UInt32 = 2
     static let firstInode: UInt32 = 11
     static let inodeSize: UInt32 = 256
+    static let incompatFeature64Bit: UInt32 = 0x80
 }
 
 /// Errors specific to EXT4Editor operations
@@ -80,7 +81,61 @@ struct EXT4SuperBlock {
     var featureCompat: UInt32 = 0
     var featureIncompat: UInt32 = 0
     var featureRoCompat: UInt32 = 0
-    // ... rest of superblock fields (we only need the above for our purposes)
+    var uuid:
+        (
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+        ) = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+    var volumeName:
+        (
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+        ) = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+    var lastMounted:
+        (
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+        ) = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+    var algorithmUsageBitmap: UInt32 = 0
+    var preallocBlocks: UInt8 = 0
+    var preallocDirBlocks: UInt8 = 0
+    var reservedGdtBlocks: UInt16 = 0
+    var journalUUID:
+        (
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+            UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
+        ) = (
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+    var journalInum: UInt32 = 0
+    var journalDev: UInt32 = 0
+    var lastOrphan: UInt32 = 0
+    var hashSeed: (UInt32, UInt32, UInt32, UInt32) = (0, 0, 0, 0)
+    var defHashVersion: UInt8 = 0
+    var journalBackupType: UInt8 = 0
+    var descSize: UInt16 = UInt16(MemoryLayout<EXT4GroupDescriptor>.size)
 }
 
 /// On-disk group descriptor structure
@@ -214,7 +269,10 @@ public final class EXT4Editor {
     }
 
     private var groupDescriptorSize: Int {
-        MemoryLayout<EXT4GroupDescriptor>.size
+        if superBlock.featureIncompat & EXT4Constants.incompatFeature64Bit != 0 {
+            return Int(superBlock.descSize)
+        }
+        return MemoryLayout<EXT4GroupDescriptor>.size
     }
 
     /// Open an existing ext4 filesystem for editing
@@ -276,7 +334,9 @@ public final class EXT4Editor {
             throw EXT4EditorError.invalidPath(path)
         }
 
-        let fileName = components.last!
+        guard let fileName = components.last else {
+            throw EXT4EditorError.invalidPath(path)
+        }
         let parentPath = "/" + components.dropLast().joined(separator: "/")
 
         // Find parent directory inode
@@ -341,7 +401,9 @@ public final class EXT4Editor {
             throw EXT4EditorError.invalidPath(path)
         }
 
-        let linkName = components.last!
+        guard let linkName = components.last else {
+            throw EXT4EditorError.invalidPath(path)
+        }
         let parentPath = "/" + components.dropLast().joined(separator: "/")
 
         // Find parent directory
@@ -402,7 +464,9 @@ public final class EXT4Editor {
             throw EXT4EditorError.invalidPath(path)
         }
 
-        let dirName = components.last!
+        guard let dirName = components.last else {
+            throw EXT4EditorError.invalidPath(path)
+        }
         let parentPath = components.count == 1 ? "/" : "/" + components.dropLast().joined(separator: "/")
 
         // Find parent directory
@@ -495,7 +559,7 @@ public final class EXT4Editor {
 
         let gd = groupDescriptors[Int(group)]
         let inodeTableOffset = UInt64(gd.inodeTableLow) * UInt64(blockSize)
-        let inodeOffset = inodeTableOffset + UInt64(indexInGroup) * UInt64(EXT4Constants.inodeSize)
+        let inodeOffset = inodeTableOffset + UInt64(indexInGroup) * UInt64(superBlock.inodeSize)
 
         try handle.seek(toOffset: inodeOffset)
         guard let inodeData = try handle.read(upToCount: MemoryLayout<EXT4Inode>.size) else {
@@ -524,7 +588,7 @@ public final class EXT4Editor {
         try handle.write(contentsOf: data)
 
         // Pad to full inode size
-        let padding = Data(repeating: 0, count: Int(EXT4Constants.inodeSize) - MemoryLayout<EXT4Inode>.size)
+        let padding = Data(repeating: 0, count: Int(superBlock.inodeSize) - MemoryLayout<EXT4Inode>.size)
         try handle.write(contentsOf: padding)
     }
 

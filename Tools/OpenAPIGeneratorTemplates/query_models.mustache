@@ -1,0 +1,26 @@
+//
+// QueryModels.swift
+//
+// Generated from OpenAPI query parameters. Do not edit by hand.
+//
+
+import Vapor
+
+{{#operations}}
+{{#operation}}
+{{#hasQueryParams}}
+struct {{#lambda.titlecase}}{{operationId}}{{/lambda.titlecase}}Query: Content {
+{{#queryParams}}
+    var {{paramName}}: {{{dataType}}}{{^required}}?{{/required}}
+{{/queryParams}}
+
+    enum CodingKeys: String, CodingKey {
+{{#queryParams}}
+        case {{paramName}}{{#baseName}} = "{{.}}"{{/baseName}}
+{{/queryParams}}
+    }
+}
+
+{{/hasQueryParams}}
+{{/operation}}
+{{/operations}}

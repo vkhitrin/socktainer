@@ -1,3 +1,4 @@
+import ContainerResource
 import Vapor
 
 struct VolumeDeleteRoute: RouteCollection {
@@ -8,18 +9,28 @@ struct VolumeDeleteRoute: RouteCollection {
     }
 
     func handler(_ req: Request) async throws -> Response {
-        guard let name = req.parameters.get("name") else {
-            throw Abort(.badRequest, reason: "Missing volume name")
-        }
+        let name = try VolumeRouteUtility.requiredVolumeName(from: req, missingReason: "Missing volume name")
+        let query = try req.query.decode(VolumeDeleteQuery.self)
+        _ = query.force
         do {
+            let volume = try? await client.inspect(name: name)
             try await client.delete(name: name)
-            return Response(status: .ok, body: .init(string: "{}"))
-        } catch {
-            if let abortError = error as? AbortError {
-                throw abortError
+            if let broadcaster = req.eventBroadcaster {
+                let event = DockerEvent.simpleEvent(
+                    id: name,
+                    type: "volume",
+                    status: "destroy",
+                    from: name,
+                    name: name,
+                    labels: volume?.labels ?? [:]
+                )
+                await broadcaster.broadcast(event)
+            } else {
+                req.logger.warning("Event broadcaster not configured; skipping volume destroy event")
             }
-            // You may want to check for not found error specifically
-            throw Abort(.internalServerError, reason: "Failed to delete volume: \(error)")
+            return Response(status: .noContent)
+        } catch {
+            throw VolumeRouteUtility.mapDeleteError(error)
         }
     }
 }

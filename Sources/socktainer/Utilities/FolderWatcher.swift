@@ -30,19 +30,12 @@ private struct FSEventsCallbackInfo {
     var eventHandler: ([String]) -> Void
 }
 
-final class FolderWatcher: @unchecked Sendable {
+actor FolderWatcher {
     private let rootURL: URL
     private let broadcaster: EventBroadcaster
     private var eventStream: FSEventStreamRef?
     private var callbackInfo: UnsafeMutablePointer<FSEventsCallbackInfo>?
-
-    // Thread-safe state
-    private let lock = NSLock()
     private var _isActive = false
-    private var isActive: Bool {
-        get { lock.withLock { _isActive } }
-        set { lock.withLock { _isActive = newValue } }
-    }
 
     // Debounce using DispatchSourceTimer for better control
     private var containerDebounceSource: DispatchSourceTimer?
@@ -55,23 +48,27 @@ final class FolderWatcher: @unchecked Sendable {
     }
 
     func startWatching() {
-        guard !isActive else { return }
+        guard !_isActive else { return }
 
         // Allocate callback info structure
-        callbackInfo = UnsafeMutablePointer<FSEventsCallbackInfo>.allocate(capacity: 1)
-        callbackInfo!.initialize(
+        let callbackInfo = UnsafeMutablePointer<FSEventsCallbackInfo>.allocate(capacity: 1)
+        callbackInfo.initialize(
             to: FSEventsCallbackInfo(
                 isValid: true,
                 eventHandler: { [weak self] paths in
-                    self?.handleEvents(paths)
+                    guard let self else { return }
+                    Swift.Task {
+                        await self.handleEvents(paths)
+                    }
                 }
             ))
+        self.callbackInfo = callbackInfo
 
         let pathsToWatch = [rootURL.path] as CFArray
 
         var context = FSEventStreamContext(
             version: 0,
-            info: UnsafeMutableRawPointer(callbackInfo!),
+            info: UnsafeMutableRawPointer(callbackInfo),
             retain: nil,
             release: nil,
             copyDescription: nil
@@ -96,7 +93,7 @@ final class FolderWatcher: @unchecked Sendable {
         FSEventStreamSetDispatchQueue(stream, DispatchQueue.global(qos: .utility))
 
         if FSEventStreamStart(stream) {
-            isActive = true
+            _isActive = true
             print("[FolderWatcher] Started watching \(rootURL.path)")
         } else {
             FSEventStreamRelease(stream)
@@ -107,9 +104,9 @@ final class FolderWatcher: @unchecked Sendable {
     }
 
     func stopWatching() {
-        guard isActive else { return }
+        guard _isActive else { return }
 
-        isActive = false
+        _isActive = false
 
         // Mark callback info as invalid first
         if let info = callbackInfo {
@@ -145,7 +142,7 @@ final class FolderWatcher: @unchecked Sendable {
     }
 
     private func handleEvents(_ paths: [String]) {
-        guard isActive else { return }
+        guard _isActive else { return }
 
         for path in paths {
             if path.contains("/.") { continue }  // Skip hidden files
@@ -164,12 +161,12 @@ final class FolderWatcher: @unchecked Sendable {
         containerDebounceSource = DispatchSource.makeTimerSource(queue: debounceQueue)
         containerDebounceSource?.schedule(deadline: .now() + 2.0)
         containerDebounceSource?.setEventHandler { [weak self] in
-            guard let self = self, self.isActive else { return }
-
-            let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "container", status: "remove")
-            Task {
-                await self.broadcaster.broadcast(event)
-                // print("[FolderWatcher] Broadcasted container event")
+            Swift.Task {
+                guard let self else { return }
+                guard await self._isActive else { return }
+                // Container lifecycle events are emitted by the route/session code
+                // with the real container identity. Do not fabricate anonymous
+                // destroy events from coarse filesystem notifications here.
             }
         }
         containerDebounceSource?.resume()
@@ -181,30 +178,13 @@ final class FolderWatcher: @unchecked Sendable {
         imageDebounceSource = DispatchSource.makeTimerSource(queue: debounceQueue)
         imageDebounceSource?.schedule(deadline: .now() + 2.0)
         imageDebounceSource?.setEventHandler { [weak self] in
-            guard let self = self, self.isActive else { return }
-
-            let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "image", status: "remove")
-            Task {
+            Swift.Task {
+                guard let self else { return }
+                guard await self._isActive else { return }
+                let event = DockerEvent.simpleEvent(id: UUID().uuidString, type: "image", status: "delete")
                 await self.broadcaster.broadcast(event)
-                // print("[FolderWatcher] Broadcasted image event")
             }
         }
         imageDebounceSource?.resume()
-    }
-
-    deinit {
-        // Mark as invalid immediately
-        if let info = callbackInfo {
-            info.pointee.isValid = false
-        }
-
-        if let stream = eventStream {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-        }
-
-        cancelDebounceTimers()
-        cleanupCallbackInfo()
     }
 }

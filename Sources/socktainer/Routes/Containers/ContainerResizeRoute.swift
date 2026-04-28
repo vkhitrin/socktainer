@@ -6,11 +6,11 @@ struct ContainerResizeRoute: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/resize", use: ContainerResizeRoute.resize(client: client))
     }
 
-    // NOTE: This is stubbed as we are not using this endpoint to resize terminal size
-    //       work needs to be done to inform the client on the new size
+    // NOTE: Apple container does not expose a Docker-compatible container TTY resize
+    // path for the init process through the API surface socktainer uses here, so this
+    // route must not pretend to succeed.
     static func resize(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-
             guard let containerId = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
@@ -24,10 +24,10 @@ struct ContainerResizeRoute: RouteCollection {
             }
 
             guard let _ = try await client.getContainer(id: containerId) else {
-                throw Abort(.notFound, reason: "Container not found")
+                throw Abort(.notFound, reason: "No such container: \(containerId)")
             }
 
-            return Response(status: .ok)
+            return AppleContainerNotSupported.respond("container resize")
         }
     }
 }

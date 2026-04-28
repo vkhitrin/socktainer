@@ -1,11 +1,8 @@
 import ContainerAPIClient
 import ContainerResource
 import ContainerizationOCI
+import Foundation
 import Vapor
-
-struct RESTImageHistoryQuery: Vapor.Content {
-    let platform: String?
-}
 
 struct ImageHistoryRoute: RouteCollection {
     let client: ClientImageProtocol
@@ -16,33 +13,37 @@ struct ImageHistoryRoute: RouteCollection {
 }
 
 extension ImageHistoryRoute {
-    private static func prioritizedManifests(_ manifests: [Descriptor], preferredPlatform: Platform?) -> [Descriptor] {
-        let primaryPlatform = requestedOrDefaultPlatform(preferredPlatform)
+    private static func patchImageHistoryJSON(_ object: inout Any) {
+        guard var items = object as? [[String: Any]] else {
+            return
+        }
 
-        return manifests.enumerated().sorted { leftManifest, rightManifest in
-            let leftPlatform = leftManifest.element.platform
-            let rightPlatform = rightManifest.element.platform
-
-            if preferredPlatformMatches(
-                leftPlatform,
-                over: rightPlatform,
-                preferredPlatform: primaryPlatform
-            ) {
-                return true
+        for index in items.indices {
+            if let tags = items[index]["Tags"] as? [Any], tags.isEmpty {
+                items[index]["Tags"] = NSNull()
             }
+        }
 
-            return leftManifest.offset < rightManifest.offset
-        }.map(\.element)
+        object = items
     }
 
     private static func historyResponseItems(
         for image: ClientImage,
         requestedName: String,
         details: ImageDetail,
-        preferredPlatform: Platform?
-    ) async throws -> [RESTImageHistoryResponseItem] {
+        preferredPlatform: Platform?,
+        allImages: [ClientImage]
+    ) async throws -> [ImageHistoryResponseItem] {
         let imageIndex = try await image.index()
-        let manifests = prioritizedManifests(imageIndex.manifests, preferredPlatform: preferredPlatform)
+        let manifests = ImageRouteUtility.prioritizedManifests(
+            imageIndex.manifests,
+            preferredPlatform: preferredPlatform
+        )
+        let references = DockerImageReferenceResolver.references(
+            for: image,
+            allImages: allImages,
+            includeDigests: false
+        )
 
         for descriptor in manifests {
             if let referenceType = descriptor.annotations?["vnd.docker.reference.type"],
@@ -65,90 +66,85 @@ extension ImageHistoryRoute {
             }
 
             let history = config.history ?? []
-            var layerIndex = 0
-            var items: [RESTImageHistoryResponseItem] = []
+            var remainingLayers = Array(manifest.layers)
+            var items: [ImageHistoryResponseItem] = []
 
-            for (index, entry) in history.enumerated() {
+            for entry in history {
                 let isEmptyLayer = entry.emptyLayer ?? false
-                let itemId: String
                 let itemSize: Int64
 
                 if isEmptyLayer {
-                    itemId = "<missing>"
                     itemSize = 0
-                } else if layerIndex < manifest.layers.count {
-                    let layer = manifest.layers[layerIndex]
-                    itemId = layer.digest
+                } else if let layer = remainingLayers.first {
                     itemSize = layer.size
-                    layerIndex += 1
+                    remainingLayers.removeFirst()
                 } else {
-                    itemId = "<missing>"
                     itemSize = 0
                 }
 
-                let tags = index == history.index(before: history.endIndex) ? [details.name] : []
-
-                items.append(
-                    RESTImageHistoryResponseItem(
-                        Id: itemId,
-                        Created: AppleContainerTimestampResolver.unixTimestampSeconds(entry.created ?? config.created),
-                        CreatedBy: entry.createdBy ?? "",
-                        Tags: tags,
-                        Size: itemSize,
-                        Comment: entry.comment ?? ""
-                    )
+                items.insert(
+                    ImageHistoryResponseItem(
+                        id: "<missing>",
+                        created: AppleContainerTimestampResolver.unixTimestampSeconds(entry.created ?? config.created),
+                        createdBy: entry.createdBy ?? "",
+                        tags: [],
+                        size: itemSize,
+                        comment: entry.comment ?? ""
+                    ),
+                    at: 0
                 )
             }
 
             if !items.isEmpty {
-                return items.reversed()
+                items[0] = ImageHistoryResponseItem(
+                    id: image.digest,
+                    created: items[0].created,
+                    createdBy: items[0].createdBy,
+                    tags: references.repoTags,
+                    size: items[0].size,
+                    comment: items[0].comment
+                )
+                return items
             }
 
             return [
-                RESTImageHistoryResponseItem(
-                    Id: image.digest,
-                    Created: AppleContainerTimestampResolver.unixTimestampSeconds(config.created),
-                    CreatedBy: "",
-                    Tags: [details.name],
-                    Size: manifest.layers.reduce(0) { $0 + $1.size },
-                    Comment: ""
+                ImageHistoryResponseItem(
+                    id: image.digest,
+                    created: AppleContainerTimestampResolver.unixTimestampSeconds(config.created),
+                    createdBy: "",
+                    tags: references.repoTags,
+                    size: manifest.layers.reduce(0) { $0 + $1.size },
+                    comment: ""
                 )
             ]
         }
 
-        throw Abort(.notFound, reason: "Image '\(requestedName)' not found")
+        throw Abort(.notFound, reason: "No such image: \(requestedName)")
     }
 
-    static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> [RESTImageHistoryResponseItem] {
+    static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let refOrId = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
 
-            let query = try req.query.decode(RESTImageHistoryQuery.self)
-            let preferredPlatform: Platform?
-            if let platformString = query.platform, !platformString.isEmpty {
-                preferredPlatform = try platformOrThrow(platformString)
-            } else {
-                preferredPlatform = nil
-            }
-
-            _ = client
-
-            let image: ClientImage
-            do {
-                image = try await ClientImage.get(reference: refOrId)
-            } catch {
-                throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
-            }
+            let query = try req.query.decode(ImageHistoryQuery.self)
+            let preferredPlatform = try ImageRouteUtility.platformOrNil(query.platform)
+            let image = try await ImageRouteUtility.getImage(referenceOrID: refOrId)
 
             let details = try await image.details()
-            return try await historyResponseItems(
+            let allImages = try await client.list(includeSystemImages: true)
+            let items = try await historyResponseItems(
                 for: image,
                 requestedName: refOrId,
                 details: details,
-                preferredPlatform: preferredPlatform
+                preferredPlatform: preferredPlatform,
+                allImages: allImages
             )
+            let encoded = try JSONEncoder().encode(items)
+            var object = try JSONSerialization.jsonObject(with: encoded)
+            patchImageHistoryJSON(&object)
+            return try ImageRouteUtility.jsonResponse(object)
         }
     }
 }

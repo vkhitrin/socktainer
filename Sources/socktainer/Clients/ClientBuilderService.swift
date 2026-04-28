@@ -1,5 +1,6 @@
 import ContainerAPIClient
 import ContainerBuild
+import ContainerCommands
 import ContainerPersistence
 import ContainerResource
 import Containerization
@@ -27,12 +28,12 @@ struct BuilderPruneResult: Sendable {
 struct BuilderCacheRecord: Sendable {
     let id: String
     let parents: [String]
-    let kind: String
-    let description: String
+    let kind: String?
+    let description: String?
     let inUse: Bool
     let shared: Bool
     let size: Int64
-    let createdAt: String
+    let createdAt: String?
     let lastUsedAt: String?
     let usageCount: Int
 }
@@ -49,29 +50,22 @@ struct ClientBuilderService: ClientBuilderProtocol {
     private let networkClient = NetworkClient()
     private let builderContainerId: String
     private let builderPort: UInt32
-    private let builderCPUs: Int64
-    private let builderMemory: String
-    private let appSupportURL: URL
 
     init(
         builderContainerId: String = "buildkit",
-        builderPort: UInt32 = 8088,
-        builderCPUs: Int64 = 2,
-        builderMemory: String = "2048MB",
-        appSupportURL: URL
+        builderPort: UInt32 = 8088
     ) {
         self.builderContainerId = builderContainerId
         self.builderPort = builderPort
-        self.builderCPUs = builderCPUs
-        self.builderMemory = builderMemory
-        self.appSupportURL = appSupportURL
     }
 
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {
-        let container = try await runningBuilderContainer(logger: logger)
-
         let command = try BuildctlUtility.pruneCommand(from: request)
-        let stdoutText = try await execute(command: command, in: container, actionName: "buildctl prune", logger: logger)
+        let stdoutText = try await executeWithBuilderRecovery(
+            command: command,
+            actionName: "buildctl prune",
+            logger: logger
+        )
 
         let entries = BuildctlUtility.parsePruneOutput(stdoutText, logger: logger)
         let deletedIds = entries.compactMap(\.id)
@@ -81,23 +75,26 @@ struct ClientBuilderService: ClientBuilderProtocol {
     }
 
     func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord] {
-        let container = try await runningBuilderContainer(logger: logger)
         let command = BuildctlUtility.duCommand()
-        let stdoutText = try await execute(command: command, in: container, actionName: "buildctl du", logger: logger)
+        let stdoutText = try await executeWithBuilderRecovery(
+            command: command,
+            actionName: "buildctl du",
+            logger: logger
+        )
 
-        return BuildctlUtility.parseDuOutput(stdoutText, logger: logger).compactMap { record in
+        return try BuildctlUtility.parseDuOutput(stdoutText, logger: logger).compactMap { record in
             guard let id = record.id else {
                 return nil
             }
             return BuilderCacheRecord(
                 id: id,
                 parents: record.parents ?? [],
-                kind: record.recordType ?? "regular",
-                description: record.recordDescription ?? "",
+                kind: record.recordType,
+                description: record.recordDescription,
                 inUse: record.inUse ?? false,
                 shared: record.shared ?? false,
                 size: record.size ?? 0,
-                createdAt: record.createdAt ?? "",
+                createdAt: record.createdAt,
                 lastUsedAt: record.lastUsedAt,
                 usageCount: record.usageCount ?? 0
             )
@@ -105,6 +102,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
     }
 
     func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {
+        try await ensureNativeBuilderStarted(logger: logger)
         _ = try await runningBuilderContainer(logger: logger)
 
         let clock = ContinuousClock()
@@ -121,7 +119,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
                 logger.debug("Builder reachability check failed: \(error)")
             }
 
-            try await Task.sleep(for: retryInterval)
+            try await Swift.Task.sleep(for: retryInterval)
         }
 
         if let lastError {
@@ -131,6 +129,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
     }
 
     func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
+        try await ensureNativeBuilderStarted(logger: logger)
         _ = try await runningBuilderContainer(logger: logger)
 
         let clock = ContinuousClock()
@@ -154,7 +153,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
                 logger.debug("Builder connection attempt failed: \(error)")
             }
 
-            try await Task.sleep(for: retryInterval)
+            try await Swift.Task.sleep(for: retryInterval)
         }
 
         if let lastError {
@@ -169,28 +168,22 @@ struct ClientBuilderService: ClientBuilderProtocol {
     }
 
     private func runningBuilderContainer(logger: Logger?) async throws -> ContainerSnapshot {
-        let container: ContainerSnapshot
-        do {
-            container = try await containerClient.get(id: builderContainerId)
-        } catch let error as ContainerizationError where error.code == .notFound {
-            logger?.info("Builder container not found, creating a new builder instance")
-            return try await createAndStartBuilder(logger: logger)
-        }
+        let container = try await containerClient.get(id: builderContainerId)
 
         guard container.status == .running else {
             switch container.status {
             case .running:
                 return container
             case .stopped:
-                logger?.info("Builder container is stopped, starting it")
-                try await startBuildKit(containerId: container.id)
-                return try await containerClient.get(id: container.id)
+                logger?.info("Builder container is stopped, starting it via native Apple builder path")
+                try await ensureNativeBuilderStarted(logger: logger)
+                return try await containerClient.get(id: builderContainerId)
             case .stopping:
                 throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is stopping")
             case .unknown:
-                logger?.warning("Builder container has unknown state, recreating it")
-                try? await containerClient.delete(id: container.id)
-                return try await createAndStartBuilder(logger: logger)
+                logger?.warning("Builder container has unknown state, recreating it via native Apple builder path")
+                try await ensureNativeBuilderStarted(logger: logger)
+                return try await containerClient.get(id: builderContainerId)
             @unknown default:
                 throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is in an unsupported state")
             }
@@ -199,56 +192,10 @@ struct ClientBuilderService: ClientBuilderProtocol {
         return container
     }
 
-    private func createAndStartBuilder(logger: Logger?) async throws -> ContainerSnapshot {
-        let exportsMount = appSupportURL.appendingPathComponent("builder")
-        if !FileManager.default.fileExists(atPath: exportsMount.path) {
-            try FileManager.default.createDirectory(at: exportsMount, withIntermediateDirectories: true)
-        }
-
-        let builderImage = DefaultsStore.get(key: .defaultBuilderImage)
-        let builderPlatform = Platform(arch: "arm64", os: "linux", variant: "v8")
-        let useRosetta = DefaultsStore.getBool(key: .buildRosetta) ?? true
-
-        let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform)
-        _ = try await image.getCreateSnapshot(platform: builderPlatform)
-        let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
-
-        let imageConfig = try await image.config(for: builderPlatform).config
-        let processConfig = ProcessConfiguration(
-            executable: "/usr/local/bin/container-builder-shim",
-            arguments: ["--debug", "--vsock", useRosetta ? nil : "--enable-qemu"].compactMap { $0 },
-            environment: imageConfig?.env ?? [],
-            workingDirectory: "/",
-            terminal: false,
-            user: .id(uid: 0, gid: 0)
-        )
-
-        var config = ContainerConfiguration(id: builderContainerId, image: imageDesc, process: processConfig)
-        config.resources = try Parser.resources(cpus: builderCPUs, memory: builderMemory)
-        config.labels = [ResourceLabelKeys.role: ResourceRoleValues.builder]
-        config.mounts = [
-            .init(type: .tmpfs, source: "", destination: "/run", options: []),
-            .init(type: .virtiofs, source: exportsMount.path, destination: "/var/lib/container-builder-shim/exports", options: []),
-        ]
-        config.rosetta = useRosetta
-
-        guard let defaultNetwork = try await networkClient.builtin else {
-            throw ContainerizationError(.invalidState, message: "default network is not present")
-        }
-        guard case .running(_, let networkStatus) = defaultNetwork else {
-            throw ContainerizationError(.invalidState, message: "default network is not running")
-        }
-
-        config.networks = [
-            AttachmentConfiguration(network: defaultNetwork.id, options: AttachmentOptions(hostname: builderContainerId))
-        ]
-        let nameserver = IPv4Address(networkStatus.ipv4Subnet.lower.value + 1).description
-        config.dns = ContainerConfiguration.DNSConfiguration(nameservers: [nameserver], domain: nil, searchDomains: [], options: [])
-
-        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
-        try await containerClient.create(configuration: config, options: .default, kernel: kernel)
-        try await startBuildKit(containerId: builderContainerId)
-        return try await containerClient.get(id: builderContainerId)
+    private func ensureNativeBuilderStarted(logger: Logger?) async throws {
+        _ = logger
+        let command = try ContainerCommands.Application.BuilderStart.parse([])
+        try await command.run()
     }
 
     private func startBuildKit(containerId: String) async throws {
@@ -284,11 +231,17 @@ struct ClientBuilderService: ClientBuilderProtocol {
             stdio: [nil, stdoutPipe.fileHandleForWriting, stderrPipe.fileHandleForWriting]
         )
 
-        try await process.start()
-        let exitCode = try await process.wait()
+        let session = ClientProcessIOSession(
+            process: process,
+            stdinPipe: nil,
+            stdoutPipe: stdoutPipe,
+            stderrPipe: stderrPipe,
+            waitFailureExitCode: -1
+        )
+        defer { session.closeClientHandles() }
 
-        try? stdoutPipe.fileHandleForWriting.close()
-        try? stderrPipe.fileHandleForWriting.close()
+        try await session.start()
+        let exitCode = await session.waitForExit()
 
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
@@ -305,6 +258,36 @@ struct ClientBuilderService: ClientBuilderProtocol {
         }
 
         return stdoutText
+    }
+
+    private func executeWithBuilderRecovery(
+        command: BuildctlUtility.Command,
+        actionName: String,
+        logger: Logger
+    ) async throws -> String {
+        do {
+            let container = try await runningBuilderContainer(logger: logger)
+            return try await execute(command: command, in: container, actionName: actionName, logger: logger)
+        } catch {
+            guard shouldRecreateBuilder(after: error) else {
+                throw error
+            }
+
+            logger.warning("\(actionName) failed due to missing BuildKit socket; recreating builder and retrying once")
+            try? await containerClient.stop(id: builderContainerId)
+            try? await containerClient.delete(id: builderContainerId)
+
+            try await ensureNativeBuilderStarted(logger: logger)
+            let container = try await runningBuilderContainer(logger: logger)
+            return try await execute(command: command, in: container, actionName: actionName, logger: logger)
+        }
+    }
+
+    private func shouldRecreateBuilder(after error: any Error) -> Bool {
+        let message = String(describing: error)
+        return message.contains("/run/buildkit/buildkitd.sock")
+            || message.contains("buildctl")
+                && message.contains("connect: no such file or directory")
     }
 
 }

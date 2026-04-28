@@ -5,18 +5,26 @@ import Foundation
 import Logging
 
 protocol ClientNetworkProtocol: Sendable {
-    func list(filters: String?, logger: Logger) async throws -> [RESTNetworkSummary]
-    func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary?
+    func list(filters: String?, logger: Logger) async throws -> [Network]
+    func getNetwork(id: String, logger: Logger) async throws -> Network?
     func delete(id: String, logger: Logger) async throws
-    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate
+    func create(name: String, labels: [String: String], logger: Logger) async throws -> NetworkCreateResponse
 }
 
 struct ClientNetworkService: ClientNetworkProtocol {
     private let networkClient = NetworkClient()
 
-    func list(filters: String? = nil, logger: Logger) async throws -> [RESTNetworkSummary] {
+    private static func matchesDockerFilterPattern(_ value: String, pattern: String) -> Bool {
+        if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+            let range = NSRange(value.startIndex..<value.endIndex, in: value)
+            return regex.firstMatch(in: value, options: [], range: range) != nil
+        }
+        return value.localizedCaseInsensitiveContains(pattern)
+    }
+
+    func list(filters: String? = nil, logger: Logger) async throws -> [Network] {
         let networksList = try await networkClient.list()
-        var allNetworks = networksList.map { RESTNetworkSummary(networkState: $0) }
+        var allNetworks = networksList.map { Network(networkState: $0) }
         let containerClient = ClientContainerService()
         let allContainers = try await containerClient.list(showAll: true, filters: [:])
 
@@ -26,64 +34,71 @@ struct ClientNetworkService: ClientNetworkProtocol {
             var containersForNetwork: [String: NetworkContainer] = [:]
             for container in allContainers {
                 for attachment in container.networks {
-                    if attachment.network == network.Id || attachment.network == network.Name {
+                    if attachment.network == network.id || attachment.network == network.name {
                         let nc = NetworkContainer(
-                            Name: container.id,
-                            EndpointID: nil,  // Apple container doesn't have a matching field
-                            MacAddress: nil,  // Apple container doesn't have a matching field
-                            IPv4Address: String(describing: attachment.ipv4Address),
-                            IPv6Address: nil
+                            name: container.id,
+                            endpointID: nil,
+                            macAddress: nil,
+                            iPv4Address: String(describing: attachment.ipv4Address),
+                            iPv6Address: nil
                         )
                         containersForNetwork[container.id] = nc
-                        logger.debug("Container \(container.id) attached to network \(network.Name) (ID: \(network.Id))")
+                        logger.debug("Container \(container.id) attached to network \(network.name ?? "<unknown>") (ID: \(network.id ?? "<unknown>"))")
                     }
                 }
             }
             if !containersForNetwork.isEmpty {
-                allNetworks[i] = RESTNetworkSummary(
-                    Name: network.Name,
-                    Id: network.Id,
-                    Created: network.Created,
-                    Scope: network.Scope,
-                    Driver: network.Driver,
-                    EnableIPv4: network.EnableIPv4,
-                    EnableIPv6: network.EnableIPv6,
-                    Internal: network.Internal,
-                    Attachable: network.Attachable,
-                    Ingress: network.Ingress,
+                allNetworks[i] = Network(
+                    name: network.name,
+                    id: network.id,
+                    created: network.created,
+                    scope: network.scope,
+                    driver: network.driver,
+                    enableIPv4: network.enableIPv4,
+                    enableIPv6: network.enableIPv6,
                     IPAM: network.IPAM,
-                    Options: network.Options,
-                    Containers: containersForNetwork,
-                    ConfigFrom: network.ConfigFrom,
-                    Labels: network.Labels,
-                    Subnet: network.Subnet,
-                    Gateway: network.Gateway
+                    internal: network.internal,
+                    attachable: network.attachable,
+                    ingress: network.ingress,
+                    configFrom: network.configFrom,
+                    configOnly: network.configOnly,
+                    containers: containersForNetwork,
+                    options: network.options,
+                    labels: network.labels,
+                    peers: network.peers
                 )
             }
         }
 
-        guard let filters = filters, let data = filters.data(using: .utf8) else { return allNetworks }
-        guard let filtersDict = try? JSONDecoder().decode([String: [String]].self, from: data) else { return allNetworks }
-        // If filtersDict contains only unknown keys, return []
-        let knownKeys: Set<String> = ["dangling", "driver", "id", "label", "name", "scope", "type"]
-        let filterKeys = Set(filtersDict.keys)
-        if !filterKeys.isEmpty && filterKeys.isDisjoint(with: knownKeys) {
-            logger.info("All filter keys are unknown: \(filterKeys). Returning empty result.")
-            return []
-        }
+        let filtersDict = try DockerNetworkFilterUtility.parseNetworkFilters(
+            filtersParam: filters,
+            defaultDangling: false,
+            logger: logger
+        )
+
         return allNetworks.filter { network in
             var excludedReason: String? = nil
-            if let danglingArr = filtersDict["dangling"], let danglingStr = danglingArr.first {
-                let isDangling = (network.Containers == nil || network.Containers?.isEmpty == true)
-                if (danglingStr == "true" && !isDangling) || (danglingStr == "false" && isDangling) {
+            if let danglingArr = filtersDict["dangling"], !danglingArr.isEmpty {
+                let isDangling = (network.containers == nil || network.containers?.isEmpty == true)
+                let matchesDangling = danglingArr.contains { danglingStr in
+                    let wantsDangling = danglingStr == "true" || danglingStr == "1"
+                    return isDangling == wantsDangling
+                }
+                if !matchesDangling {
                     excludedReason = "dangling mismatch"
                 }
             }
-            if let driverArr = filtersDict["driver"], let driver = driverArr.first {
-                if network.Driver.caseInsensitiveCompare(driver) != ComparisonResult.orderedSame { excludedReason = "driver mismatch" }
+            if let driverArr = filtersDict["driver"], !driverArr.isEmpty {
+                let matchesDriver = driverArr.contains { driver in
+                    (network.driver ?? "").caseInsensitiveCompare(driver) == .orderedSame
+                }
+                if !matchesDriver { excludedReason = "driver mismatch" }
             }
-            if let idArr = filtersDict["id"], let id = idArr.first {
-                if !network.Id.localizedCaseInsensitiveContains(id) { excludedReason = "id mismatch" }
+            if let idArr = filtersDict["id"], !idArr.isEmpty {
+                let matchesID = idArr.contains { id in
+                    Self.matchesDockerFilterPattern(network.id ?? "", pattern: id)
+                }
+                if !matchesID { excludedReason = "id mismatch" }
             }
             if let labels = filtersDict["label"] {
                 for label in labels {
@@ -91,34 +106,45 @@ struct ClientNetworkService: ClientNetworkProtocol {
                         let parts = label.split(separator: "=", maxSplits: 1)
                         let key = String(parts[0])
                         let value = String(parts[1])
-                        if network.Labels[key] != value { excludedReason = "label key=value mismatch" }
+                        if network.labels?[key] != value { excludedReason = "label key=value mismatch" }
                     } else {
-                        if network.Labels[label] == nil { excludedReason = "label key missing" }
+                        if network.labels?[label] == nil { excludedReason = "label key missing" }
                     }
                 }
             }
-            if let nameArr = filtersDict["name"], let name = nameArr.first {
-                if !network.Name.localizedCaseInsensitiveContains(name) { excludedReason = "name mismatch" }
+            if let nameArr = filtersDict["name"], !nameArr.isEmpty {
+                let matchesName = nameArr.contains { name in
+                    Self.matchesDockerFilterPattern(network.name ?? "", pattern: name)
+                }
+                if !matchesName { excludedReason = "name mismatch" }
             }
-            if let scopeArr = filtersDict["scope"], let scope = scopeArr.first {
-                if !network.Scope.localizedCaseInsensitiveContains(scope) { excludedReason = "scope mismatch" }
+            if let scopeArr = filtersDict["scope"], !scopeArr.isEmpty {
+                let matchesScope = scopeArr.contains { scope in
+                    (network.scope ?? "").caseInsensitiveCompare(scope) == .orderedSame
+                }
+                if !matchesScope { excludedReason = "scope mismatch" }
             }
-            if let typeArr = filtersDict["type"], let type = typeArr.first {
-                let isCustom = network.Driver != "bridge" && network.Driver != "host" && network.Driver != "null"
-                if type == "custom" && !isCustom { excludedReason = "type custom mismatch" }
-                if type == "builtin" && isCustom { excludedReason = "type builtin mismatch" }
+            if let typeArr = filtersDict["type"], !typeArr.isEmpty {
+                let driver = network.driver ?? ""
+                let isCustom = driver != "bridge" && driver != "host" && driver != "null"
+                let matchesType = typeArr.contains { type in
+                    (type == "custom" && isCustom) || (type == "builtin" && !isCustom)
+                }
+                if !matchesType { excludedReason = "type mismatch" }
             }
             if let reason = excludedReason {
-                logger.debug("Excluding network \(network.Name) (ID: \(network.Id)) due to: \(reason)")
+                logger.debug("Excluding network \(network.name ?? "<unknown>") (ID: \(network.id ?? "<unknown>")) due to: \(reason)")
                 return false
             }
             return true
         }
     }
 
-    func getNetwork(id: String, logger: Logger) async throws -> RESTNetworkSummary? {
+    func getNetwork(id: String, logger: Logger) async throws -> Network? {
         let networks = try await list(logger: logger)
-        return networks.first { $0.Id == id || $0.Name == id }
+        return networks.first { network in
+            network.id == id || (network.id?.hasPrefix(id) ?? false) || network.name == id
+        }
     }
 
     func delete(id: String, logger: Logger) async throws {
@@ -126,7 +152,7 @@ struct ClientNetworkService: ClientNetworkProtocol {
         logger.debug("Deleted network with id: \(id)")
     }
 
-    func create(name: String, labels: [String: String], logger: Logger) async throws -> RESTNetworkCreate {
+    func create(name: String, labels: [String: String], logger: Logger) async throws -> NetworkCreateResponse {
         // NOTE: We will only create networks of type NAT for the time being (mimic the container CLI)
         let configuration = try NetworkConfiguration(
             id: name,
@@ -136,15 +162,19 @@ struct ClientNetworkService: ClientNetworkProtocol {
         )
         _ = try await networkClient.create(configuration: configuration)
         logger.debug("Created network with id: \(configuration.id)")
-        return RESTNetworkCreate(Id: configuration.id, Warning: "")
+        return NetworkCreateResponse(id: configuration.id, warning: "")
     }
 }
 
-extension RESTNetworkSummary {
+extension Network {
     init(networkState: NetworkState) {
         let id: String
         let driver: String
-        let options: [String: String] = [:]  // Not provided by Apple container
+        // Apple Container does not expose Docker bridge-driver metadata such as
+        // `com.docker.network.bridge.*` or driver-specific IPAM/network options.
+        // Keep `Options` empty here and let parity notes/documentation call out
+        // that this is an Apple backend limitation rather than inventing values.
+        let options: [String: String] = [:]
         let labels: [String: String]
         var subnet: String? = nil
         var gateway: String? = nil
@@ -168,28 +198,25 @@ extension RESTNetworkSummary {
         )
 
         self.init(
-            Name: id,
-            Id: id,
-            Created: createdTimestamp,
-            Scope: "local",  // We will always use "local", other modes are not available
-            Driver: driver,
-            EnableIPv4: true,
-            // NOTE: IPv6 is not used in Apple container
-            //       https://github.com/apple/container/issues/460
-            EnableIPv6: false,
-            // NOTE: IPv6 is not used in Apple container
-            //       https://github.com/apple/container/issues/460
-            // NOTE: Apple container has no mechanism to set networks as internal
-            Internal: false,
-            Attachable: false,
-            Ingress: false,  // Only applicable for Swarm
-            IPAM: NetworkIPAM(Driver: "", Config: []),  // Currently, there are no IPAM capabilities
-            Options: options,
-            Containers: nil,
-            ConfigFrom: nil,
-            Labels: labels,
-            Subnet: subnet,
-            Gateway: gateway
+            name: id,
+            id: id,
+            created: createdTimestamp,
+            scope: "local",
+            driver: driver,
+            enableIPv4: true,
+            enableIPv6: false,
+            IPAM: DockerNetworkIPAMMapper.networkIPAM(from: networkState),
+            internal: false,
+            attachable: false,
+            ingress: false,
+            // Docker includes ConfigFrom.Network as an empty string for regular
+            // local networks that are not derived from a config-only source.
+            configFrom: .init(network: ""),
+            configOnly: false,
+            containers: nil,
+            options: options,
+            labels: labels,
+            peers: nil
         )
     }
 }

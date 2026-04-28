@@ -6,6 +6,7 @@ struct AppleContainerImageStoreResolver {
     struct DescriptorExtras {
         let data: String?
         let artifactType: String?
+        let annotations: [String: String]?
     }
 
     static func descriptorExtras(
@@ -27,7 +28,8 @@ struct AppleContainerImageStoreResolver {
 
         return DescriptorExtras(
             data: descriptor["data"] as? String,
-            artifactType: descriptor["artifactType"] as? String
+            artifactType: descriptor["artifactType"] as? String,
+            annotations: stringDictionary(from: descriptor["annotations"])
         )
     }
 
@@ -45,7 +47,7 @@ struct AppleContainerImageStoreResolver {
             .appendingPathComponent("snapshot-info", isDirectory: false)
 
         guard
-            let data = try? Data(contentsOf: infoURL),
+            let data = try? FileIOUtility.readData(at: infoURL),
             let filesystem = try? JSONDecoder().decode(Filesystem.self, from: data)
         else {
             return nil
@@ -77,7 +79,7 @@ struct AppleContainerImageStoreResolver {
             name = "tmpfs"
         }
 
-        return DriverData(Name: name, Data: driverData)
+        return DriverData(name: name, data: driverData)
     }
 
     private static func blobURL(appSupportURL: URL, digest: String) -> URL {
@@ -90,7 +92,7 @@ struct AppleContainerImageStoreResolver {
 
     private static func jsonObject(at url: URL) -> Any? {
         guard
-            let data = try? Data(contentsOf: url),
+            let data = try? FileIOUtility.readData(at: url),
             let object = try? JSONSerialization.jsonObject(with: data)
         else {
             return nil
@@ -120,5 +122,21 @@ struct AppleContainerImageStoreResolver {
         }
 
         return nil
+    }
+
+    private static func stringDictionary(from value: Any?) -> [String: String]? {
+        guard let dictionary = value as? [String: Any] else {
+            return value as? [String: String]
+        }
+
+        var result: [String: String] = [:]
+        result.reserveCapacity(dictionary.count)
+        for (key, value) in dictionary {
+            guard let stringValue = value as? String else {
+                continue
+            }
+            result[key] = stringValue
+        }
+        return result.isEmpty ? nil : result
     }
 }

@@ -1,7 +1,12 @@
 import ContainerAPIClient
+import ContainerResource
+import ContainerSandboxServiceClient
+import Containerization
 import ContainerizationArchive
 import ContainerizationEXT4
+import Darwin
 import Foundation
+import NIO
 import SystemPackage
 import Vapor
 
@@ -73,7 +78,7 @@ struct PathStat: Codable {
     let size: Int64
     let mode: UInt32
     let mtime: String
-    let linkTarget: String?
+    let linkTarget: String
 
     enum CodingKeys: String, CodingKey {
         case name
@@ -89,59 +94,126 @@ protocol ClientArchiveProtocol: Sendable {
     /// Get the path to a container's rootfs
     func getRootfsPath(containerId: String) -> URL
 
+    /// Get stat information for a file or directory inside a container.
+    func statPath(containerId: String, path: String) async throws -> PathStat
+
     /// Read a file or directory from a container's filesystem and return as tar data
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat)
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
+    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool, containerIsRunning: Bool) async throws
 }
 
 /// Service for performing archive operations on container filesystems
 struct ClientArchiveService: ClientArchiveProtocol {
     private let appSupportPath: URL
+    private static let guestWriteChunkSize = 1024 * 1024
+
+    private struct RuntimeConfigurationSnapshot: Decodable {
+        let containerRootFilesystem: Filesystem?
+    }
+
+    private struct RunningContainerSandboxSession {
+        let sandbox: SandboxClient
+        let agent: Vminitd
+        let group: MultiThreadedEventLoopGroup
+        let guestRootfsPath: String
+    }
 
     init(appSupportPath: URL) {
         self.appSupportPath = appSupportPath
     }
 
-    /// Get the path to a container's rootfs.ext4 file
-    func getRootfsPath(containerId: String) -> URL {
+    private func bundlePath(containerId: String) -> URL {
         appSupportPath
             .appendingPathComponent("containers")
             .appendingPathComponent(containerId)
+    }
+
+    private func runtimeConfigurationPath(containerId: String) -> URL {
+        bundlePath(containerId: containerId)
+            .appendingPathComponent("runtime-configuration.json")
+    }
+
+    private func containerConfiguration(containerId: String) throws -> ContainerConfiguration {
+        try Bundle(path: bundlePath(containerId: containerId)).configuration
+    }
+
+    /// Get the path to a container's rootfs.ext4 file
+    func getRootfsPath(containerId: String) -> URL {
+        bundlePath(containerId: containerId)
             .appendingPathComponent("rootfs.ext4")
+    }
+
+    private func resolveRootfsPath(containerId: String) throws -> URL {
+        func runtimeRootfsPath() throws -> URL? {
+            let runtimeConfigPath = runtimeConfigurationPath(containerId: containerId)
+            guard FileManager.default.fileExists(atPath: runtimeConfigPath.path) else {
+                return nil
+            }
+
+            let data = try FileIOUtility.readData(at: runtimeConfigPath)
+            let runtimeConfiguration = try JSONDecoder().decode(RuntimeConfigurationSnapshot.self, from: data)
+            if let filesystem = runtimeConfiguration.containerRootFilesystem, filesystem.isBlock,
+                FileManager.default.fileExists(atPath: filesystem.source)
+            {
+                return URL(fileURLWithPath: filesystem.source)
+            }
+            return nil
+        }
+
+        let directRootfsPath = getRootfsPath(containerId: containerId)
+        if FileManager.default.fileExists(atPath: directRootfsPath.path) {
+            return directRootfsPath
+        }
+
+        if let runtimeRootfsPath = try runtimeRootfsPath() {
+            return runtimeRootfsPath
+        }
+
+        let bundle = Bundle(path: bundlePath(containerId: containerId))
+        if let filesystem = try? bundle.containerRootfs, filesystem.isBlock,
+            FileManager.default.fileExists(atPath: filesystem.source)
+        {
+            return URL(fileURLWithPath: filesystem.source)
+        }
+
+        throw ClientArchiveError.rootfsNotFound(id: containerId)
+    }
+
+    private func normalizedPathStat(reader: EXT4.EXT4Reader, path: String) throws -> (String, PathStat) {
+        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
+
+        guard reader.exists(FilePath(normalizedPath)) else {
+            throw ClientArchiveError.pathNotFound(path: normalizedPath)
+        }
+
+        let (_, inode) = try reader.stat(FilePath(normalizedPath), followSymlinks: false)
+        let pathStat = PathStat(
+            name: (normalizedPath as NSString).lastPathComponent,
+            size: inode.size,
+            mode: UInt32(inode.permissions),
+            mtime: DockerTimestampUtility.pathStatTimestamp(Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
+            linkTarget: inode.isSymlink ? (readSymlinkTarget(reader: reader, path: normalizedPath) ?? "") : ""
+        )
+
+        return (normalizedPath, pathStat)
+    }
+
+    func statPath(containerId: String, path: String) async throws -> PathStat {
+        let rootfsPath = try resolveRootfsPath(containerId: containerId)
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+        let (_, stat) = try normalizedPathStat(reader: reader, path: path)
+        return stat
     }
 
     /// Read a file or directory from a container's filesystem and return as tar data
     /// This implementation reads only the requested path directly, avoiding full filesystem export.
     func getArchive(containerId: String, path: String) async throws -> (tarData: Data, stat: PathStat) {
-        let rootfsPath = getRootfsPath(containerId: containerId)
+        let rootfsPath = try resolveRootfsPath(containerId: containerId)
 
-        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            throw ClientArchiveError.rootfsNotFound(id: containerId)
-        }
-
-        // Normalize the path
-        let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
-
-        // Open the ext4 filesystem
         let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
-
-        // Check if path exists and get stat
-        guard reader.exists(FilePath(normalizedPath)) else {
-            throw ClientArchiveError.pathNotFound(path: normalizedPath)
-        }
-
-        let (_, inode) = try reader.stat(FilePath(normalizedPath))
-
-        // Create PathStat for the response header
-        let pathStat = PathStat(
-            name: (normalizedPath as NSString).lastPathComponent,
-            size: inode.size,
-            mode: UInt32(inode.mode),
-            mtime: ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(inode.mtime))),
-            linkTarget: inode.isSymlink ? readSymlinkTarget(reader: reader, path: normalizedPath) : nil
-        )
+        let (normalizedPath, pathStat) = try normalizedPathStat(reader: reader, path: path)
 
         // Create temporary directory for tar creation
         let tempDir = FileManager.default.temporaryDirectory
@@ -163,18 +235,14 @@ struct ClientArchiveService: ClientArchiveProtocol {
         try ArchiveUtility.create(tarPath: tarPath, from: stagingDir)
 
         // Read the tar data
-        let tarData = try Data(contentsOf: tarPath)
+        let tarData = try FileIOUtility.readData(at: tarPath)
 
         return (tarData: tarData, stat: pathStat)
     }
 
     /// Extract a tar archive into a container's filesystem at the specified path
-    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {
-        let rootfsPath = getRootfsPath(containerId: containerId)
-
-        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
-            throw ClientArchiveError.rootfsNotFound(id: containerId)
-        }
+    func putArchive(containerId: String, path: String, tarPath: URL, noOverwriteDirNonDir: Bool, containerIsRunning: Bool) async throws {
+        let rootfsPath = try resolveRootfsPath(containerId: containerId)
 
         // Normalize the destination path
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
@@ -187,10 +255,171 @@ struct ClientArchiveService: ClientArchiveProtocol {
             noOverwriteDirNonDir: noOverwriteDirNonDir
         )
 
+        if containerIsRunning {
+            try await putArchiveInGuest(
+                containerId: containerId,
+                destinationPath: normalizedPath,
+                inputTarPath: tarPath
+            )
+            return
+        }
+
         try await putArchiveFallback(
             rootfsPath: rootfsPath,
             destinationPath: normalizedPath,
             inputTarPath: tarPath
+        )
+    }
+
+    private func writeGuestFile(
+        agent: Vminitd,
+        path: String,
+        data: Data,
+        mode: UInt32
+    ) async throws {
+        // Containerization 0.31.0 started chunking large file writes in ContentWriter.
+        // Mirror that here for live archive extraction so we do not push an entire file
+        // through a single guest-agent gRPC payload when copying into a running container.
+        if data.isEmpty {
+            let flags = WriteFileFlags(createParentDirectories: true, append: false, create: true)
+            try await agent.writeFile(path: path, data: data, flags: flags, mode: mode)
+            return
+        }
+
+        var offset = 0
+        var isFirstChunk = true
+        while offset < data.count {
+            let end = min(offset + Self.guestWriteChunkSize, data.count)
+            let chunk = data.subdata(in: offset..<end)
+            let flags = WriteFileFlags(
+                createParentDirectories: true,
+                append: !isFirstChunk,
+                create: isFirstChunk
+            )
+            try await agent.writeFile(path: path, data: chunk, flags: flags, mode: mode)
+            offset = end
+            isFirstChunk = false
+        }
+    }
+
+    private func putArchiveInGuest(
+        containerId: String,
+        destinationPath: String,
+        inputTarPath: URL
+    ) async throws {
+        let session = try await createRunningContainerSandboxSession(containerId: containerId)
+        defer {
+            Swift.Task {
+                try? await session.agent.close()
+                try? await session.group.shutdownGracefully()
+            }
+        }
+
+        let archiveReader = try ArchiveReader(
+            format: .paxRestricted,
+            filter: .none,
+            file: inputTarPath
+        )
+
+        let rootfsPath = try resolveRootfsPath(containerId: containerId)
+        let existingReader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+
+        var knownDirectories: Set<String> = ["/", destinationPath]
+
+        func ensureDirectory(_ path: String, mode: UInt16 = 0o755) async throws {
+            guard path != "/", !knownDirectories.contains(path) else {
+                return
+            }
+
+            let parentPath = (path as NSString).deletingLastPathComponent
+            let normalizedParent = parentPath.isEmpty ? "/" : parentPath
+            try await ensureDirectory(normalizedParent, mode: 0o755)
+            // NOTE: Apple's live guest agent exposes mkdir but does not provide
+            // a chmod/chown path for directories here. We create the directory
+            // in guest space and rely on the default guest permissions.
+            try await session.agent.mkdir(
+                path: session.guestRootfsPath + path,
+                all: false,
+                perms: UInt32(mode)
+            )
+            knownDirectories.insert(path)
+        }
+
+        try await ensureDirectory(destinationPath, mode: 0o755)
+
+        func existingPathIsDirectory(_ path: String) throws -> Bool {
+            guard existingReader.exists(FilePath(path)) else {
+                return false
+            }
+            let (_, inode) = try existingReader.stat(FilePath(path), followSymlinks: false)
+            return inode.isDirectory
+        }
+
+        func pathExists(_ path: String) -> Bool {
+            existingReader.exists(FilePath(path))
+        }
+
+        for (entry, data) in archiveReader {
+            guard let fullPath = ArchiveUtility.destinationPath(for: entry.path, under: destinationPath) else {
+                continue
+            }
+
+            let parentPath = (fullPath as NSString).deletingLastPathComponent
+            let normalizedParent = parentPath.isEmpty ? "/" : parentPath
+
+            switch entry.fileType {
+            case .directory:
+                if try existingPathIsDirectory(fullPath) || knownDirectories.contains(fullPath) {
+                    knownDirectories.insert(fullPath)
+                    continue
+                }
+                try await ensureDirectory(fullPath, mode: entry.permissions)
+            case .regular:
+                try await ensureDirectory(normalizedParent, mode: 0o755)
+                guard !pathExists(fullPath) else {
+                    // NOTE: In the Apple containerization version socktainer is
+                    // pinned to, the live guest agent exposes writeFile but not
+                    // a truncate-or-replace file copy API. Reject overwrites for
+                    // running containers instead of corrupting file contents.
+                    throw ClientArchiveError.operationFailed(
+                        message: "Overwriting existing files in a running container is not yet supported for \(fullPath)"
+                    )
+                }
+                try await writeGuestFile(
+                    agent: session.agent,
+                    path: session.guestRootfsPath + fullPath,
+                    data: data,
+                    mode: UInt32(entry.permissions)
+                )
+            case .symbolicLink:
+                // NOTE: Apple exposes live file copy APIs for running containers,
+                // but the guest agent does not expose symlink creation. Reject
+                // these uploads for running containers instead of mutating the
+                // backing ext4 image under a live guest.
+                throw ClientArchiveError.operationFailed(
+                    message: "Symlinks are not supported for archive extraction into a running container at \(fullPath)"
+                )
+            default:
+                throw ClientArchiveError.operationFailed(
+                    message: "Archive entry type \(entry.fileType) is not supported for archive extraction into a running container at \(fullPath)"
+                )
+            }
+        }
+
+        try await session.agent.sync()
+    }
+
+    private func createRunningContainerSandboxSession(containerId: String) async throws -> RunningContainerSandboxSession {
+        let configuration = try containerConfiguration(containerId: containerId)
+        let sandbox = try await SandboxClient.create(id: containerId, runtime: configuration.runtimeHandler)
+        let connection = try await sandbox.dial(Vminitd.port)
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let agent = try Vminitd(connection: connection, group: group)
+        return RunningContainerSandboxSession(
+            sandbox: sandbox,
+            agent: agent,
+            group: group,
+            guestRootfsPath: "/run/container/\(containerId)/rootfs"
         )
     }
 
@@ -308,7 +537,9 @@ struct ClientArchiveService: ClientArchiveProtocol {
 
     /// Extract a path from the ext4 filesystem to a local directory
     private func extractPathToDirectory(reader: EXT4.EXT4Reader, sourcePath: String, destDir: URL) throws {
-        let (_, inode) = try reader.stat(FilePath(sourcePath))
+        // Inspect the raw inode first so broken symlinks can still be archived
+        // as symlink entries instead of failing the whole directory export.
+        let (_, inode) = try reader.stat(FilePath(sourcePath), followSymlinks: false)
         let baseName = sourcePath == "/" ? nil : (sourcePath as NSString).lastPathComponent
 
         if inode.isDirectory {

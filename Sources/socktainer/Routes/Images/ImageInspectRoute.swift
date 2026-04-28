@@ -1,12 +1,8 @@
 import ContainerAPIClient
 import ContainerResource
 import ContainerizationOCI
+import Foundation
 import Vapor
-
-struct RESTImageInspectQuery: Vapor.Content {
-    let manifests: Bool?
-    let platform: String?
-}
 
 struct ImageInspectRoute: RouteCollection {
     let client: ClientImageProtocol
@@ -17,81 +13,18 @@ struct ImageInspectRoute: RouteCollection {
 }
 
 extension ImageInspectRoute {
-    private static func makeOCIDescriptor(
-        from descriptor: Descriptor,
-        appSupportURL: URL? = nil,
-        parentDigest: String? = nil
-    ) -> OCIDescriptor {
-        let platform = descriptor.platform.map {
-            OCIDescriptor.OCIPlatform(
-                architecture: $0.architecture,
-                os: $0.os,
-                osVersion: $0.osVersion,
-                osFeatures: $0.osFeatures,
-                variant: $0.variant
-            )
-        }
-
-        let extras: AppleContainerImageStoreResolver.DescriptorExtras? =
-            if let appSupportURL, let parentDigest {
-                AppleContainerImageStoreResolver.descriptorExtras(
-                    appSupportURL: appSupportURL,
-                    parentDigest: parentDigest,
-                    childDigest: descriptor.digest
-                )
-            } else {
-                nil
-            }
-
-        return OCIDescriptor(
-            mediaType: descriptor.mediaType,
-            digest: descriptor.digest,
-            size: descriptor.size,
-            urls: descriptor.urls,
-            annotations: descriptor.annotations,
-            data: extras?.data,
-            platform: platform,
-            artifactType: extras?.artifactType
-        )
+    private static func defaultPlatform(from manifests: [Descriptor]) -> Platform? {
+        manifests.first {
+            $0.annotations?["vnd.docker.reference.type"] != "attestation-manifest"
+                && $0.platform != nil
+        }?.platform
     }
 
-    private static func prioritizedManifests(_ manifests: [Descriptor]) -> [Descriptor] {
-        let primaryPlatform = requestedOrDefaultPlatform(nil)
-
-        return manifests.enumerated().sorted { leftManifest, rightManifest in
-            let leftPlatform = leftManifest.element.platform
-            let rightPlatform = rightManifest.element.platform
-
-            if preferredPlatformMatches(
-                leftPlatform,
-                over: rightPlatform,
-                preferredPlatform: primaryPlatform
-            ) {
-                return true
-            }
-
-            return leftManifest.offset < rightManifest.offset
-        }.map(\.element)
-    }
-
-    private static func repoDigestReference(name: String, digest: String?) -> String? {
-        guard let digest, !digest.isEmpty, !name.isEmpty else {
-            return nil
-        }
-
-        if let reference = try? Reference.parse(name) {
-            return "\(reference.name)@\(digest)"
-        }
-
-        if let atIndex = name.firstIndex(of: "@") {
-            return "\(name[..<atIndex])@\(digest)"
-        }
-
-        return "\(name)@\(digest)"
-    }
-
-    private static func prioritizeVariants(_ variants: [ImageDetail.Variants]) -> [ImageDetail.Variants] {
-        let hostPlatform = requestedOrDefaultPlatform(nil)
+    private static func prioritizeVariants(
+        _ variants: [ImageDetail.Variants],
+        preferredPlatform: Platform? = nil
+    ) -> [ImageDetail.Variants] {
+        let preferredPlatform = requestedOrDefaultPlatform(preferredPlatform)
 
         return variants.enumerated().sorted { leftVariant, rightVariant in
             let leftPlatform = leftVariant.element.platform
@@ -100,7 +33,7 @@ extension ImageInspectRoute {
             if preferredPlatformMatches(
                 leftPlatform,
                 over: rightPlatform,
-                preferredPlatform: hostPlatform
+                preferredPlatform: preferredPlatform
             ) {
                 return true
             }
@@ -109,21 +42,34 @@ extension ImageInspectRoute {
         }.map(\.element)
     }
 
-    private static func inspectPlatformOrThrow(_ platformString: String?) throws -> Platform? {
-        guard let platformString, !platformString.isEmpty else {
-            return nil
+    private static func patchImageInspectJSON(_ object: inout Any) {
+        guard var image = object as? [String: Any] else { return }
+
+        if var config = image["Config"] as? [String: Any] {
+            if config["User"] == nil {
+                config["User"] = ""
+            }
+            for key in ["Entrypoint", "Labels", "OnBuild", "Volumes"] where config[key] == nil {
+                config[key] = NSNull()
+            }
+            image["Config"] = config
         }
 
-        return try platformOrThrow(platformString)
+        if var manifests = image["Manifests"] as? [[String: Any]] {
+            ImagePresentationUtility.patchUnavailableManifestContainers(in: &manifests)
+            image["Manifests"] = manifests
+        }
+
+        object = image
     }
 
-    static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> RESTImageInspect {
+    static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let refOrId = req.parameters.get("name") else {
                 throw Abort(.badRequest, reason: "Missing image name parameter")
             }
-            let query = try req.query.decode(RESTImageInspectQuery.self)
-            let requestedPlatform = try inspectPlatformOrThrow(query.platform)
+            let query = try req.query.decode(ImageInspectQuery.self)
+            let requestedPlatform = try ImageRouteUtility.platformOrNil(query.platform)
             let includeManifests = (query.manifests ?? false) && requestedPlatform == nil
             guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
@@ -131,23 +77,17 @@ extension ImageInspectRoute {
 
             _ = client
 
-            let image: ClientImage
-            do {
-                image = try await ClientImage.get(reference: refOrId)
-            } catch {
-                throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
-            }
+            let image = try await ImageRouteUtility.getImage(referenceOrID: refOrId)
 
+            async let allImages = client.list(includeSystemImages: true)
             let containers = includeManifests ? try await ContainerClient().list() : []
             let details: ImageDetail = try await image.details()
             let imageIndex = try await image.index()
+            let availableImages = try await allImages
             let manifests = imageIndex.manifests
             let availablePlatforms = Set(details.variants.map(\.platform))
+            let preferredPlatform = requestedOrDefaultPlatform(requestedPlatform)
             var manifestSummaries: [ImageManifestSummary] = []
-            let containerIDs =
-                containers
-                .filter { $0.configuration.image.reference == image.reference || $0.configuration.image.reference == details.name }
-                .map(\.id)
 
             for descriptor in manifests {
                 let kind: String
@@ -176,47 +116,26 @@ extension ImageInspectRoute {
                     available = false
                 }
 
-                let contentSize = (manifest?.config.size ?? 0) + (manifest?.layers.reduce(0) { $0 + $1.size } ?? 0)
-                let totalSize = descriptor.size + contentSize
-
                 if includeManifests {
-                    let unpackedSize =
-                        kind == "image"
-                        ? AppleContainerSnapshotResolver.unpackedSize(
-                            appSupportURL: appleContainerAppSupportUrl,
-                            descriptor: descriptor
-                        ) : 0
-                    let platformSummary = platform.map {
-                        OCIDescriptor.OCIPlatform(
-                            architecture: $0.architecture,
-                            os: $0.os,
-                            osVersion: $0.osVersion,
-                            osFeatures: $0.osFeatures,
-                            variant: $0.variant
-                        )
-                    }
+                    let knownReferences = Set(
+                        [image.reference] + (details.name.isEmpty ? [] : [details.name])
+                    )
 
                     manifestSummaries.append(
-                        ImageManifestSummary(
-                            ID: descriptor.digest,
-                            Descriptor: makeOCIDescriptor(
-                                from: descriptor,
-                                appSupportURL: appleContainerAppSupportUrl,
-                                parentDigest: details.index.digest
-                            ),
-                            Available: available,
-                            Kind: kind,
-                            Size: .init(Total: totalSize + unpackedSize, Content: contentSize),
-                            ImageData: kind == "image"
-                                ? .init(
-                                    Platform: platformSummary,
-                                    Containers: containerIDs,
-                                    Size: .init(Unpacked: unpackedSize)
-                                ) : nil,
-                            AttestationData: kind == "attestation"
-                                ? .init(
-                                    For: descriptor.annotations?["vnd.docker.reference.digest"] ?? ""
-                                ) : nil
+                        ImagePresentationUtility.makeManifestSummary(
+                            descriptor: descriptor,
+                            parentDigest: details.index.digest,
+                            appSupportURL: appleContainerAppSupportUrl,
+                            available: available,
+                            manifest: manifest,
+                            kind: kind == "attestation" ? .attestation : .image,
+                            containerIDs: (available && platform != nil)
+                                ? ImagePresentationUtility.manifestContainerIDs(
+                                    imageDigest: image.digest,
+                                    knownReferences: knownReferences,
+                                    platform: platform!,
+                                    containers: containers
+                                ) : []
                         )
                     )
                 }
@@ -225,27 +144,31 @@ extension ImageInspectRoute {
             let selectedVariant =
                 if let requestedPlatform {
                     details.variants.first(where: { $0.platform == requestedPlatform })
+                } else if let defaultPlatform = defaultPlatform(from: manifests) {
+                    details.variants.first(where: { $0.platform == defaultPlatform })
                 } else {
-                    prioritizeVariants(details.variants).first
+                    prioritizeVariants(details.variants, preferredPlatform: preferredPlatform).first
                 }
 
             if let selectedVariant {
-                let selectedManifest = try? await image.manifest(for: selectedVariant.platform)
                 let imageConfig: ImageConfig? = selectedVariant.config.config.map { ociConfig in
                     ImageConfig(
-                        User: ociConfig.user,
-                        ExposedPorts: nil,
-                        Env: ociConfig.env,
-                        Cmd: ociConfig.cmd,
-                        Healthcheck: nil,
-                        ArgsEscaped: nil,
-                        Volumes: nil,
-                        WorkingDir: ociConfig.workingDir,
-                        Entrypoint: ociConfig.entrypoint,
-                        OnBuild: nil,
-                        Labels: ociConfig.labels,
-                        StopSignal: ociConfig.stopSignal,
-                        Shell: nil
+                        // Apple omits the image user when the config inherits the runtime
+                        // default. Docker still serializes this as "", so preserve that
+                        // value instead of dropping the key.
+                        user: ociConfig.user ?? "",
+                        exposedPorts: nil,
+                        env: ociConfig.env,
+                        cmd: ociConfig.cmd,
+                        healthcheck: nil,
+                        argsEscaped: nil,
+                        volumes: nil,
+                        workingDir: ociConfig.workingDir,
+                        entrypoint: ociConfig.entrypoint,
+                        onBuild: nil,
+                        labels: ociConfig.labels,
+                        stopSignal: ociConfig.stopSignal,
+                        shell: nil
                     )
                 }
 
@@ -254,53 +177,66 @@ extension ImageInspectRoute {
                         && descriptor.annotations?["vnd.docker.reference.type"] != "attestation-manifest"
                 }
 
-                let rootFS = RootFS(
-                    rootfsType: selectedVariant.config.rootfs.type,
-                    Layers: selectedVariant.config.rootfs.diffIDs
+                let rootFS = ImageInspectRootFS(
+                    type: selectedVariant.config.rootfs.type,
+                    layers: selectedVariant.config.rootfs.diffIDs
                 )
+                let references = DockerImageReferenceResolver.references(
+                    for: image,
+                    allImages: availableImages,
+                    includeDigests: true
+                )
+                // NOTE: Apple container does not persist legacy-builder metadata for
+                // images. Docker's v1.51 schema allows DockerVersion to be an empty
+                // string, so prefer "" over omitting the field entirely.
 
-                let summary = RESTImageInspect(
-                    Id: selectedManifest?.config.digest ?? image.digest,
-                    Descriptor: makeOCIDescriptor(
+                let summary = ImageInspect(
+                    // Docker reports the top-level image digest here, even when we
+                    // select a concrete platform variant for the rest of the payload.
+                    id: image.digest,
+                    descriptor: ImagePresentationUtility.makeOCIDescriptor(
                         from: details.index,
                         appSupportURL: appleContainerAppSupportUrl
                     ),
-                    Manifests: includeManifests ? manifestSummaries : nil,
-                    RepoTags: [details.name],
-                    RepoDigests: repoDigestReference(name: details.name, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
-                    Parent: "",
-                    Comment: selectedVariant.config.history?.last?.comment ?? "",
-                    Created: selectedVariant.config.created,
-                    DockerVersion: "",
-                    Author: selectedVariant.config.author ?? "",
-                    Config: imageConfig,
-                    Architecture: selectedVariant.config.architecture,
-                    Variant: selectedVariant.config.variant,
-                    Os: selectedVariant.config.os,
-                    OsVersion: selectedVariant.config.osVersion,
-                    Size: selectedVariant.size,
-                    GraphDriver: selectedDescriptor.map {
+                    manifests: includeManifests ? manifestSummaries : nil,
+                    repoTags: references.repoTags,
+                    repoDigests: references.repoDigests,
+                    parent: "",
+                    comment: selectedVariant.config.history?.last?.comment ?? "",
+                    created: selectedVariant.config.created,
+                    dockerVersion: "",
+                    author: selectedVariant.config.author ?? "",
+                    config: imageConfig,
+                    architecture: selectedVariant.config.architecture,
+                    variant: selectedVariant.config.variant,
+                    os: selectedVariant.config.os,
+                    osVersion: selectedVariant.config.osVersion,
+                    size: selectedVariant.size,
+                    graphDriver: selectedDescriptor.map {
                         AppleContainerImageStoreResolver.graphDriver(
                             appSupportURL: appleContainerAppSupportUrl,
                             descriptor: $0
                         )
                     } ?? nil,
-                    RootFS: rootFS,
+                    rootFS: rootFS,
                     // Docker's schema allows Metadata.LastTagTime, but Apple's image
                     // reference store only persists `reference -> descriptor` in state.json.
                     // There is no authoritative per-tag timestamp to surface here, so
-                    // we emit `Metadata.LastTagTime` as null instead of inventing a value.
-                    Metadata: .init(LastTagTime: nil)
+                    // we omit `Metadata.LastTagTime` instead of inventing a value.
+                    metadata: .init(lastTagTime: nil)
                 )
 
-                return summary
+                let encoded = try JSONEncoder().encode(summary)
+                var object = try JSONSerialization.jsonObject(with: encoded)
+                patchImageInspectJSON(&object)
+                return try ImageRouteUtility.jsonResponse(object)
             }
 
-            if let requestedPlatform {
-                throw Abort(.notFound, reason: "Image '\(refOrId)' does not provide platform '\(requestedPlatform.description)'")
+            if requestedPlatform != nil {
+                throw Abort(.notFound, reason: "No such image: \(refOrId)")
             }
 
-            throw Abort(.notFound, reason: "Image '\(refOrId)' not found")
+            throw Abort(.notFound, reason: "No such image: \(refOrId)")
         }
     }
 }

@@ -1,22 +1,7 @@
 import ContainerAPIClient
+import ContainerResource
 import Foundation
 import Vapor
-
-/// Query parameters for GET /containers/{id}/archive
-struct ContainerArchiveGetQuery: Content {
-    /// Path to a file or directory inside the container
-    let path: String
-}
-
-/// Query parameters for PUT /containers/{id}/archive
-struct ContainerArchivePutQuery: Content {
-    /// Path to a directory in the container to extract the archive's contents into
-    let path: String
-    /// If true, do not overwrite existing directory with non-directory and vice versa
-    let noOverwriteDirNonDir: Bool?
-    /// If true, copy UID/GID from the source archive
-    let copyUIDGID: Bool?
-}
 
 struct ContainerArchiveRoute: RouteCollection {
     let containerClient: ClientContainerProtocol
@@ -40,48 +25,68 @@ struct ContainerArchiveRoute: RouteCollection {
         )
     }
 
+    private static func containerID(from request: Request) throws -> String {
+        guard let id = request.parameters.get("id") else {
+            throw Abort(.badRequest, reason: "Missing container ID")
+        }
+        return id
+    }
+
+    private static func container(
+        for id: String,
+        using containerClient: ClientContainerProtocol
+    ) async throws -> ContainerSnapshot {
+        guard let container = try await containerClient.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+        return container
+    }
+
+    private static func archiveErrorAbort(_ error: ClientArchiveError, containerID: String) -> Abort {
+        switch error {
+        case .containerNotFound:
+            return Abort(.notFound, reason: "No such container: \(containerID)")
+        case .pathNotFound:
+            return Abort(.notFound, reason: error.localizedDescription)
+        case .invalidPath:
+            return Abort(.badRequest, reason: error.localizedDescription)
+        default:
+            return Abort(.internalServerError, reason: error.localizedDescription)
+        }
+    }
+
+    private static func statHeaderValue(_ stat: PathStat) throws -> String {
+        try JSONEncoder().encode(stat).base64EncodedString()
+    }
+
     /// GET /containers/{id}/archive - Get a tar archive of a resource in the filesystem of container id
     static func getHandler(
         containerClient: ClientContainerProtocol,
         archiveClient: ClientArchiveProtocol
     ) -> @Sendable (Request) async throws -> Response {
         { req in
-            guard let id = req.parameters.get("id") else {
-                throw Abort(.badRequest, reason: "Missing container ID")
-            }
-
-            let query = try req.query.decode(ContainerArchiveGetQuery.self)
-
-            // Verify container exists
-            guard let container = try await containerClient.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
+            let id = try containerID(from: req)
+            let query = try req.query.decode(ContainerArchiveInfoQuery.self)
+            let container = try await container(for: id, using: containerClient)
 
             do {
                 let (tarData, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
 
-                // Create the path stat header (base64 encoded JSON)
-                let statJson = try JSONEncoder().encode(stat)
-                let statBase64 = statJson.base64EncodedString()
-
                 var headers = HTTPHeaders()
                 headers.add(name: .contentType, value: "application/x-tar")
-                headers.add(name: "X-Docker-Container-Path-Stat", value: statBase64)
+                headers.add(name: .contentLength, value: String(tarData.count))
+                headers.add(name: "X-Docker-Container-Path-Stat", value: try statHeaderValue(stat))
 
+                // NOTE: Apple container's archive API returns the tar payload that
+                // socktainer streams back here. The route is functionally aligned,
+                // but exact Moby tar/compression details depend on the backend.
                 return Response(
                     status: .ok,
                     headers: headers,
                     body: .init(data: tarData)
                 )
             } catch let error as ClientArchiveError {
-                switch error {
-                case .pathNotFound:
-                    throw Abort(.notFound, reason: error.localizedDescription)
-                case .rootfsNotFound:
-                    throw Abort(.notFound, reason: error.localizedDescription)
-                default:
-                    throw Abort(.internalServerError, reason: error.localizedDescription)
-                }
+                throw archiveErrorAbort(error, containerID: id)
             }
         }
     }
@@ -92,17 +97,22 @@ struct ContainerArchiveRoute: RouteCollection {
         archiveClient: ClientArchiveProtocol
     ) -> @Sendable (Request) async throws -> Response {
         { req in
-            guard let id = req.parameters.get("id") else {
-                throw Abort(.badRequest, reason: "Missing container ID")
+            let id = try containerID(from: req)
+
+            let query = try req.query.decode(PutContainerArchiveQuery.self)
+            if let contentType = req.headers.first(name: .contentType),
+                !contentType.isEmpty,
+                !contentType.lowercased().hasPrefix("application/x-tar"),
+                !contentType.lowercased().hasPrefix("application/octet-stream")
+            {
+                throw Abort(.badRequest, reason: "Content-Type must be application/x-tar or application/octet-stream")
             }
+            let container = try await container(for: id, using: containerClient)
 
-            let query = try req.query.decode(ContainerArchivePutQuery.self)
-
-            // Verify container exists
-            guard let container = try await containerClient.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
-
+            // NOTE: Apple container's archive extraction API consumes a tarball
+            // path, not a streaming reader. Buffer the upload to a temporary tar
+            // file first, which keeps the route compatible but limits exact
+            // Docker-style streaming archive semantics.
             let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             let tarPath = tempDir.appendingPathComponent("archive.tar")
             try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -111,59 +121,31 @@ struct ContainerArchiveRoute: RouteCollection {
                 try? FileManager.default.removeItem(at: tempDir)
             }
 
-            var fileHandle: FileHandle?
-            var totalBytesWritten = 0
+            try await RequestBodyFileUtility.writeRequestBody(
+                req,
+                to: tarPath,
+                failureReason: "Failed to process archive upload"
+            )
 
             do {
-                FileManager.default.createFile(atPath: tarPath.path, contents: nil)
-                fileHandle = try FileHandle(forWritingTo: tarPath)
+                // NOTE: The current unpack path already applies tar owner/group
+                // metadata during extraction. Accept copyUIDGID instead of
+                // rejecting it, even though extraction is still buffered through
+                // a temporary tarball and broader archive-write fidelity remains
+                // best-effort.
+                _ = query.copyUIDGID
 
-                if let bodyData = req.body.data {
-                    let data = Data(buffer: bodyData)
-                    try fileHandle?.write(contentsOf: data)
-                    totalBytesWritten = data.count
-                } else {
-                    for try await var chunk in req.body {
-                        guard let data = chunk.readData(length: chunk.readableBytes) else {
-                            continue
-                        }
-                        try fileHandle?.write(contentsOf: data)
-                        totalBytesWritten += data.count
-                    }
-                }
-
-                try fileHandle?.synchronize()
-                try fileHandle?.close()
-                fileHandle = nil
-            } catch {
-                try? fileHandle?.close()
-                throw Abort(.badRequest, reason: "Failed to process archive upload: \(error.localizedDescription)")
-            }
-
-            guard totalBytesWritten > 0 else {
-                throw Abort(.badRequest, reason: "Request body is required")
-            }
-
-            do {
                 try await archiveClient.putArchive(
                     containerId: container.id,
                     path: query.path,
                     tarPath: tarPath,
-                    noOverwriteDirNonDir: query.noOverwriteDirNonDir ?? false
+                    noOverwriteDirNonDir: (query.noOverwriteDirNonDir?.lowercased()).map { ["1", "true", "yes", "on"].contains($0) } ?? false,
+                    containerIsRunning: container.status == .running
                 )
 
                 return Response(status: .ok)
             } catch let error as ClientArchiveError {
-                switch error {
-                case .pathNotFound:
-                    throw Abort(.notFound, reason: error.localizedDescription)
-                case .rootfsNotFound:
-                    throw Abort(.notFound, reason: error.localizedDescription)
-                case .invalidPath:
-                    throw Abort(.badRequest, reason: error.localizedDescription)
-                default:
-                    throw Abort(.internalServerError, reason: error.localizedDescription)
-                }
+                throw archiveErrorAbort(error, containerID: id)
             }
         }
     }
@@ -174,37 +156,23 @@ struct ContainerArchiveRoute: RouteCollection {
         archiveClient: ClientArchiveProtocol
     ) -> @Sendable (Request) async throws -> Response {
         { req in
-            guard let id = req.parameters.get("id") else {
-                throw Abort(.badRequest, reason: "Missing container ID")
-            }
-
-            let query = try req.query.decode(ContainerArchiveGetQuery.self)
-
-            // Verify container exists
-            guard let container = try await containerClient.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
+            let id = try containerID(from: req)
+            let query = try req.query.decode(ContainerArchiveInfoQuery.self)
+            let container = try await container(for: id, using: containerClient)
 
             do {
-                let (_, stat) = try await archiveClient.getArchive(containerId: container.id, path: query.path)
-
-                // Create the path stat header (base64 encoded JSON)
-                let statJson = try JSONEncoder().encode(stat)
-                let statBase64 = statJson.base64EncodedString()
+                let stat = try await archiveClient.statPath(containerId: container.id, path: query.path)
 
                 var headers = HTTPHeaders()
-                headers.add(name: "X-Docker-Container-Path-Stat", value: statBase64)
+                headers.add(name: "X-Docker-Container-Path-Stat", value: try statHeaderValue(stat))
 
+                // NOTE: Vapor auto-adds `Content-Length: 0` for empty responses.
+                // Real Docker omits that header on this HEAD path, so raw header
+                // parity here remains framework-limited even though the stat payload
+                // itself is aligned more closely now.
                 return Response(status: .ok, headers: headers)
             } catch let error as ClientArchiveError {
-                switch error {
-                case .pathNotFound:
-                    throw Abort(.notFound, reason: error.localizedDescription)
-                case .rootfsNotFound:
-                    throw Abort(.notFound, reason: error.localizedDescription)
-                default:
-                    throw Abort(.internalServerError, reason: error.localizedDescription)
-                }
+                throw archiveErrorAbort(error, containerID: id)
             }
         }
     }

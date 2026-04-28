@@ -170,7 +170,7 @@ enum BuildctlUtility {
     }
 
     static func duCommand() -> Command {
-        var arguments = [
+        let arguments = [
             "--addr", "unix:///run/buildkit/buildkitd.sock",
             "du",
             "--format=json",
@@ -200,15 +200,18 @@ enum BuildctlUtility {
         return results
     }
 
-    static func parseDuOutput(_ output: String, logger: Logger) -> [DuRecord] {
+    static func parseDuOutput(_ output: String, logger: Logger) throws -> [DuRecord] {
         guard let data = output.data(using: .utf8) else {
-            return []
+            throw ContainerizationError(.invalidArgument, message: "buildctl du returned non-UTF8 output")
         }
         do {
-            return try JSONDecoder().decode([DuRecord].self, from: data)
+            // NOTE: buildctl emits JSON `null` for an empty cache set instead of
+            // `[]`. Treat that as a truthful empty result rather than routing
+            // /system/df through its degraded fallback path.
+            return try JSONDecoder().decode([DuRecord]?.self, from: data) ?? []
         } catch {
             logger.debug("Failed to decode buildctl du JSON output: \(error)")
-            return []
+            throw ContainerizationError(.invalidArgument, message: "Failed to decode buildctl du output")
         }
     }
 

@@ -17,6 +17,7 @@ BUILD_CONFIGURATION ?= debug
 SWIFT := "swift"
 DESTDIR ?= /usr/local/
 ROOT_DIR := $(shell git rev-parse --show-toplevel)
+MOBY_OPENAPI_SPEC_URL ?= https://raw.githubusercontent.com/moby/moby/refs/heads/master/api/docs/v1.51.yaml
 
 MACOS_VERSION := $(shell sw_vers -productVersion)
 MACOS_MAJOR := $(shell echo $(MACOS_VERSION) | cut -d. -f1)
@@ -59,6 +60,7 @@ help:
 	@echo "Available targets:"
 	@echo "  all              - Build socktainer (default)"
 	@echo "  build            - Build in debug mode"
+	@echo "  generate-models  - Generate Swift models from the Moby OpenAPI spec"
 	@echo "  release          - Build in release mode"
 	@echo "  test             - Run tests"
 	@echo "  fmt              - Format source code"
@@ -73,6 +75,34 @@ help:
 .PHONY: test
 test:
 	@$(SWIFT) test -c $(BUILD_CONFIGURATION)
+
+.PHONY: generate-models
+generate-models:
+	@command -v openapi-generator >/dev/null 2>&1 || { \
+		echo "error: openapi-generator is not available in PATH" >&2; \
+		exit 1; \
+	} && \
+	TMP_DIR="$$(mktemp -d)" && \
+	SPEC_PATH="$$TMP_DIR/spec.yaml" && \
+	RAW_OUTPUT_DIR="$$TMP_DIR/OpenAPIGeneratorSwiftModelsRaw" && \
+	OUTPUT_DIR="$(ROOT_DIR)/Sources/socktainer/Models" && \
+	trap 'rm -rf "$$TMP_DIR"' EXIT && \
+	echo "Downloading OpenAPI spec from $(MOBY_OPENAPI_SPEC_URL)..." && \
+	curl --fail --silent --show-error --location "$(MOBY_OPENAPI_SPEC_URL)" --output "$$SPEC_PATH" && \
+	echo "Generating raw Swift models into $$RAW_OUTPUT_DIR..." && \
+	openapi-generator generate \
+		-i "$$SPEC_PATH" \
+		-g swift6 \
+		-c Tools/OpenAPIGeneratorTemplates/config.yaml \
+		-t Tools/OpenAPIGeneratorTemplates \
+		-o "$$RAW_OUTPUT_DIR" \
+		--global-property apis,models,apiDocs=false,apiTests=false,modelDocs=false,modelTests=false,supportingFiles && \
+	echo "Copying generated schema and query models into $$OUTPUT_DIR..." && \
+	rm -rf "$$OUTPUT_DIR" && \
+	mkdir -p "$$OUTPUT_DIR" && \
+	find "$$RAW_OUTPUT_DIR/Sources/OpenAPIClient/Models" -name '*.swift' -exec cp {} "$$OUTPUT_DIR" \; && \
+	cp "$$RAW_OUTPUT_DIR/Sources/OpenAPIClient/Infrastructure/JSONValue.swift" "$$OUTPUT_DIR" && \
+	echo "Generated models are available under $$OUTPUT_DIR"
 
 .PHONY: fmt
 fmt:	swift-fmt

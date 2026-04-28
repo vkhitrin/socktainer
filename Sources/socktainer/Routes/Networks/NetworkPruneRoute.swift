@@ -6,42 +6,63 @@ struct NetworkPruneRoute: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/networks/prune", use: NetworkPruneRoute.handler)
     }
 
-    static func handler(_ req: Request) async throws -> Response {
+    static func handler(_ req: Request) async throws -> NetworkPruneResponse {
         let networkClient = ClientNetworkService()
-        let query = try req.query.decode(RESTNetworksListQuery.self)
-        let filtersParam = query.filters
-
+        let query = try req.query.decode(NetworkListQuery.self)
         // Use utility to parse filters (default to dangling)
-        let parsedFilters = try DockerNetworkFilterUtility.parseNetworkFilters(filtersParam: filtersParam, defaultDangling: true, logger: req.logger)
+        let parsedFilters = try DockerNetworkFilterUtility.parseNetworkFilters(filtersParam: query.filters, defaultDangling: true, logger: req.logger)
 
         let filtersJSON = try JSONEncoder().encode(parsedFilters)
         let filtersJSONString = String(data: filtersJSON, encoding: .utf8)
 
         var deletedNetworks: [String] = []
-        var errors: [String: String] = [:]
         do {
             let networks = try await networkClient.list(filters: filtersJSONString, logger: req.logger)
             for network in networks {
-                if network.Name == "default" {
-                    req.logger.info("Skipping deletion of default network: \(network.Id)")
+                if network.name == "default" {
+                    req.logger.info("Skipping deletion of default network: \(network.id ?? "")")
                     continue
                 }
                 do {
-                    try await networkClient.delete(id: network.Id, logger: req.logger)
-                    deletedNetworks.append(network.Id)
+                    try await networkClient.delete(id: network.id ?? "", logger: req.logger)
+                    if let networkId = network.id {
+                        deletedNetworks.append(networkId)
+                    }
+                    if let broadcaster = req.eventBroadcaster {
+                        let event = DockerEvent.simpleEvent(
+                            id: network.id ?? "",
+                            type: "network",
+                            status: "remove",
+                            from: network.name ?? "",
+                            name: network.name ?? "",
+                            labels: network.labels ?? [:]
+                        )
+                        await broadcaster.broadcast(event)
+                    }
                 } catch {
-                    errors[network.Id] = String(describing: error)
-                    req.logger.error("Failed to delete network \(network.Id): \(error)")
+                    req.logger.error("Failed to delete network \(network.id ?? ""): \(error)")
                 }
             }
-            let responseBody: [String: Any] = [
-                "NetworksDeleted": deletedNetworks,
-                "Errors": errors,
-            ]
-            let responseData = try JSONSerialization.data(withJSONObject: responseBody, options: [])
-            return Response(status: .ok, body: .init(data: responseData))
+            if let broadcaster = req.eventBroadcaster {
+                let event = DockerEvent.simpleEvent(
+                    id: "networks",
+                    type: "network",
+                    status: "prune",
+                    from: "networks",
+                    name: "networks"
+                )
+                await broadcaster.broadcast(event)
+            } else {
+                req.logger.warning("Event broadcaster not configured; skipping network prune event")
+            }
+            return NetworkPruneResponse(
+                networksDeleted: deletedNetworks.isEmpty ? nil : deletedNetworks
+            )
         } catch {
-            return Response(status: .internalServerError, body: .init(string: "Failed to prune networks: \(error)"))
+            if let abort = error as? AbortError {
+                throw abort
+            }
+            throw Abort(.internalServerError, reason: "Failed to prune networks: \(error)")
         }
     }
 }

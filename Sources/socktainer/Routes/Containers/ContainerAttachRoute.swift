@@ -1,18 +1,10 @@
 import ContainerAPIClient
 import ContainerResource
 import Foundation
+import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1
 import Vapor
-
-private struct ContainerAttachQuery: Content {
-    let logs: Bool?
-    let stream: Bool?
-    let stdin: Bool?
-    let stdout: Bool?
-    let stderr: Bool?
-    let detachKeys: String?
-}
 
 struct ContainerAttachRoute: RouteCollection {
     let client: ClientContainerProtocol
@@ -23,31 +15,92 @@ struct ContainerAttachRoute: RouteCollection {
 }
 
 extension ContainerAttachRoute {
+    private static func stdioLogPath(for containerID: String, req: Request) -> String? {
+        guard let appSupportURL = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
+            return nil
+        }
+
+        let candidate =
+            appSupportURL
+            .appendingPathComponent("containers", isDirectory: true)
+            .appendingPathComponent(containerID, isDirectory: true)
+            .appendingPathComponent("stdio.log", isDirectory: false)
+
+        guard FileManager.default.fileExists(atPath: candidate.path) else {
+            return nil
+        }
+
+        return candidate.path
+    }
+
+    private struct EventNetworkContext {
+        let id: String
+        let name: String
+        let type: String
+    }
+
+    private static func containerAutoRemove(_ container: ContainerSnapshot) -> Bool {
+        ContainerLabelUtility.boolValue(
+            container.configuration.labels[SocktainerContainerMetadata.autoRemoveLabel]
+        ) == true
+    }
+
+    private static func containerOpenStdin(_ container: ContainerSnapshot) -> Bool {
+        ContainerLabelUtility.boolValue(
+            container.configuration.labels[SocktainerContainerMetadata.openStdinLabel]
+        ) == true
+    }
+
+    private static func primaryNetworkIdentifier(for container: ContainerSnapshot) -> String? {
+        if let network = container.networks.first?.network, !network.isEmpty {
+            return network
+        }
+        if let network = container.configuration.networks.first?.network, !network.isEmpty {
+            return network
+        }
+        return nil
+    }
+
+    private static func resolveEventNetworkContext(
+        for container: ContainerSnapshot,
+        logger: Logger
+    ) async -> EventNetworkContext? {
+        guard let identifier = primaryNetworkIdentifier(for: container) else {
+            return nil
+        }
+
+        let service = ClientNetworkService()
+        if let network = try? await service.getNetwork(id: identifier, logger: logger) {
+            return EventNetworkContext(
+                id: network.id ?? identifier,
+                name: network.name ?? identifier,
+                type: network.driver ?? "unknown"
+            )
+        }
+
+        return EventNetworkContext(id: identifier, name: identifier, type: "unknown")
+    }
+
+    private static func networkLifecycleEvent(
+        network: EventNetworkContext,
+        action: String,
+        containerID: String
+    ) -> DockerEvent {
+        DockerEvent.simpleEvent(
+            id: network.id,
+            type: "network",
+            status: action,
+            name: network.name,
+            labels: [
+                "container": containerID,
+                "type": network.type,
+            ]
+        )
+    }
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-            // TODO: This should be refactored to some generic implementation that is shared
-            //       with /containers/{id}/exec route.
-            let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
-            let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
-            let shouldUpgradeToTCP = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
-
-            let response = try await handleAttachRequest(req: req, client: client)
-
-            // If client requested upgrade and handler returned OK,
-            // convert to 101 Switching Protocols
-            if shouldUpgradeToTCP && response.status == .ok {
-                var hijackedHeaders: HTTPHeaders = [:]
-                hijackedHeaders.add(name: "Connection", value: "Upgrade")
-                hijackedHeaders.add(name: "Upgrade", value: "tcp")
-
-                return Response(
-                    status: .switchingProtocols,
-                    headers: hijackedHeaders,
-                    body: response.body
-                )
-            }
-
-            return response
+            try await handleAttachRequest(req: req, client: client)
         }
     }
 
@@ -60,16 +113,11 @@ extension ContainerAttachRoute {
 
         let logs = query.logs ?? false
         let stream = query.stream ?? false
-        let stdin = query.stdin ?? false
         let stdout = query.stdout ?? false
         let stderr = query.stderr ?? false
-        // NOTE: Not currently implemented, we use the default keys
-        let _ = query.detachKeys ?? "ctrl-c,ctrl-p"
 
-        // NOTE: We currently do not implement this mechanism
-        //       as in Docker CLI
-        guard stream || logs else {
-            throw Abort(.badRequest, reason: "Either the stream or logs parameter must be true")
+        if let detachKeys = query.detachKeys, !detachKeys.isEmpty {
+            req.logger.debug("Ignoring custom attach detachKeys '\(detachKeys)'")
         }
 
         // If no stdout/stderr specified, default to both (Docker behavior)
@@ -87,11 +135,11 @@ extension ContainerAttachRoute {
 
         let isTTY = container.configuration.initProcess.terminal
 
-        // NOTE: When stdin is true, we will start the container before the client
-        //       this might be a workaround for the time being.
-        //       We are interested in having access to stdin file descriptor from the start
-        if stdin {
-            return try await handleAttachWithStdin(
+        // For stopped containers, attach to the main process stdio directly.
+        // This is required for short-lived commands, because polling logs after
+        // process start is inherently racy and can miss their output entirely.
+        if container.status == .stopped {
+            return try await handleAttachToStoppedContainer(
                 req: req,
                 client: client,
                 container: container,
@@ -102,8 +150,23 @@ extension ContainerAttachRoute {
             )
         }
 
-        // Set appropriate content type based on TTY mode
-        let contentType = isTTY ? "application/vnd.docker.raw-stream" : "application/vnd.docker.multiplexed-stream"
+        // For running containers, Docker closes the attach response when the
+        // caller requests historical logs only (`stream=0`). Treat that as a
+        // bounded replay of currently available log output instead of entering
+        // the live polling loop below, which would otherwise never finish for
+        // long-running containers.
+        if logs && !stream {
+            return try await replayRunningContainerLogs(
+                containerID: container.id,
+                query: query,
+                isTTY: isTTY,
+                replayLogPath: stdioLogPath(for: container.id, req: req)
+            )
+        }
+
+        // Docker's attach endpoint advertises the raw stream media type even when
+        // the payload contains multiplexed frames for non-TTY containers.
+        let contentType = "application/vnd.docker.raw-stream"
 
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: contentType)
@@ -113,23 +176,96 @@ extension ContainerAttachRoute {
             headers.add(name: "Upgrade", value: "tcp")
         }
 
+        let replayLogPath = stdioLogPath(for: container.id, req: req)
+
+        // NOTE: For already-running containers, Apple container does not expose a
+        // Docker-compatible API to reattach directly to the init process stdio.
+        // socktainer therefore falls back to host-side logs on this path. When
+        // the combined `stdio.log` file exists, prefer tailing it over the live
+        // log handles so attach does not leak Apple VM bootstrap stderr into the
+        // user-visible stream.
+        //
+        // Apple persists only one merged stdio transcript here, so socktainer
+        // cannot truthfully reconstruct Docker's separate stdout/stderr replay
+        // channels from this backend data. The current behavior intentionally
+        // favors "clean merged output" over "noisy but split output".
         // Create streaming response body using container logs when not using stdin
         let body = Response.Body { writer in
-            Task.detached {
+            Swift.Task.detached {
                 let pollInterval: UInt64 = 200_000_000  // 200ms
                 var containerWasRunning = false
+                let wantStdout = stdout || (!stdout && !stderr)
+                let wantStderr = stderr || (!stdout && !stderr)
+                let mergedStreamType: DockerStreamFrame.StreamType = wantStdout ? .stdout : .stderr
 
                 defer {
                     _ = writer.write(.end)
                 }
 
+                if let replayLogPath {
+                    var offset = 0
+
+                    while true {
+                        let containerStatus: RuntimeStatus
+                        do {
+                            guard let currentContainer = try await client.getContainer(id: id) else {
+                                break
+                            }
+                            containerStatus = currentContainer.status
+                        } catch {
+                            break
+                        }
+
+                        if containerStatus == .running {
+                            containerWasRunning = true
+                        }
+
+                        if wantStdout || wantStderr,
+                            let data = FileManager.default.contents(atPath: replayLogPath),
+                            data.count > offset
+                        {
+                            let delta = data.subdata(in: offset..<data.count)
+                            offset = data.count
+
+                            let capacity = min(delta.count + (isTTY ? 0 : 8), 65536)
+                            var buffer = sharedAllocator.buffer(capacity: capacity)
+                            buffer.writeDockerFrame(streamType: mergedStreamType, data: delta, ttyMode: isTTY)
+                            _ = writer.write(.buffer(buffer))
+                        }
+
+                        if containerStatus != .running {
+                            if containerWasRunning {
+                                break
+                            }
+                            try? await Swift.Task.sleep(nanoseconds: pollInterval)
+                            continue
+                        }
+
+                        do {
+                            try await Swift.Task.sleep(nanoseconds: pollInterval)
+                        } catch {
+                            break
+                        }
+                    }
+
+                    return
+                }
+
                 // Continuously poll for log handles and send data
                 while true {
-                    // Check if container still exists
+                    // Check if container still exists and capture its current state.
+                    let containerStatus: RuntimeStatus
                     do {
-                        _ = try await client.getContainer(id: id)
+                        guard let currentContainer = try await client.getContainer(id: id) else {
+                            break
+                        }
+                        containerStatus = currentContainer.status
                     } catch {
                         break
+                    }
+
+                    if containerStatus == .running {
+                        containerWasRunning = true
                     }
 
                     var logHandles: [FileHandle] = []
@@ -150,21 +286,19 @@ extension ContainerAttachRoute {
                     }
 
                     if hasValidHandles {
-                        let shouldAttachStdout = stdout || (!stdout && !stderr)
                         var consecutiveEmptyReads = 0
                         let maxEmptyReads = 50  // Switch to polling after 100 empty reads
                         while true {
                             // Check if container still exists before reading data
+                            let currentStatus: RuntimeStatus
                             do {
                                 let currentContainer = try await client.getContainer(id: id)
                                 guard let container = currentContainer else {
                                     return
                                 }
-                                if container.status == .running {
+                                currentStatus = container.status
+                                if currentStatus == .running {
                                     containerWasRunning = true
-                                } else if containerWasRunning {
-                                    // Container was running but now stopped - exit
-                                    return
                                 }
                             } catch {
                                 // Container not available, exit
@@ -173,7 +307,7 @@ extension ContainerAttachRoute {
 
                             var hasData = false
 
-                            if shouldAttachStdout && logHandles.indices.contains(0) {
+                            if wantStdout && logHandles.indices.contains(0) {
                                 let stdoutData = logHandles[0].availableData
                                 if !stdoutData.isEmpty {
                                     hasData = true
@@ -184,29 +318,52 @@ extension ContainerAttachRoute {
                                 }
                             }
 
+                            if wantStderr && logHandles.indices.contains(1) {
+                                let stderrData = logHandles[1].availableData
+                                if !stderrData.isEmpty {
+                                    hasData = true
+                                    let capacity = min(stderrData.count + (isTTY ? 0 : 8), 65536)
+                                    var buffer = sharedAllocator.buffer(capacity: capacity)
+                                    buffer.writeDockerFrame(streamType: .stderr, data: stderrData, ttyMode: isTTY)
+                                    _ = writer.write(.buffer(buffer))
+                                }
+                            }
+
                             if !hasData {
+                                if currentStatus != .running {
+                                    // For short-lived commands we may never observe the
+                                    // running state before their output is flushed.
+                                    // Once the container is stopped and there is no more
+                                    // data to send, close the attach stream.
+                                    return
+                                }
+
                                 consecutiveEmptyReads += 1
 
                                 // After many empty reads, send keep-alive less frequently
                                 if consecutiveEmptyReads >= maxEmptyReads {
                                     consecutiveEmptyReads = 0  // Reset counter
-                                    try await Task.sleep(nanoseconds: 500_000_000)  // 500ms
+                                    try await Swift.Task.sleep(nanoseconds: 500_000_000)  // 500ms
                                 } else {
-                                    try await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+                                    try await Swift.Task.sleep(nanoseconds: 50_000_000)  // 50ms
                                 }
                             } else {
                                 consecutiveEmptyReads = 0
-                                try await Task.sleep(nanoseconds: 5_000_000)  // 5ms when active
+                                try await Swift.Task.sleep(nanoseconds: 5_000_000)  // 5ms when active
                             }
                         }
 
                     } else {
+                        if containerWasRunning || containerStatus != .running {
+                            break
+                        }
+
                         // No valid handles, just wait
-                        try await Task.sleep(nanoseconds: pollInterval)
+                        try await Swift.Task.sleep(nanoseconds: pollInterval)
                     }
 
                     do {
-                        try await Task.sleep(nanoseconds: pollInterval)
+                        try await Swift.Task.sleep(nanoseconds: pollInterval)
                     } catch {
                         break
                     }
@@ -223,7 +380,100 @@ extension ContainerAttachRoute {
         )
     }
 
-    private static func handleAttachWithStdin(
+    private static func replayRunningContainerLogs(
+        containerID: String,
+        query: ContainerAttachQuery,
+        isTTY: Bool,
+        replayLogPath: String?
+    ) async throws -> Response {
+        let wantStdout = query.stdout ?? true
+        let wantStderr = query.stderr ?? !isTTY
+        let contentType = "application/vnd.docker.raw-stream"
+
+        let body = Response.Body { writer in
+            Swift.Task.detached {
+                let idlePollLimit = 10
+                let pollInterval: UInt64 = 50_000_000
+                var stdoutOffset = 0
+                var stderrOffset = 0
+                var idlePolls = 0
+
+                defer {
+                    _ = writer.write(.end)
+                }
+
+                func emit(_ data: Data, streamType: DockerStreamFrame.StreamType) {
+                    guard !data.isEmpty else {
+                        return
+                    }
+                    let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                    var buffer = sharedAllocator.buffer(capacity: capacity)
+                    buffer.writeDockerFrame(streamType: streamType, data: data, ttyMode: isTTY)
+                    _ = writer.write(.buffer(buffer))
+                }
+
+                while idlePolls < idlePollLimit {
+                    if let replayLogPath,
+                        let data = FileManager.default.contents(atPath: replayLogPath),
+                        data.count > stdoutOffset
+                    {
+                        let streamType: DockerStreamFrame.StreamType = wantStdout ? .stdout : .stderr
+                        emit(data.subdata(in: stdoutOffset..<data.count), streamType: streamType)
+                        stdoutOffset = data.count
+                        idlePolls = 0
+                        try? await Swift.Task.sleep(nanoseconds: pollInterval)
+                        continue
+                    }
+
+                    let (stdoutHandle, stderrHandle) = openStoppedContainerLogHandles(containerID: containerID)
+                    defer {
+                        try? stdoutHandle?.close()
+                        try? stderrHandle?.close()
+                    }
+
+                    var emittedData = false
+
+                    if wantStdout,
+                        let stdoutHandle,
+                        let data = try? stdoutHandle.readToEnd(),
+                        data.count > stdoutOffset
+                    {
+                        emit(data.subdata(in: stdoutOffset..<data.count), streamType: .stdout)
+                        stdoutOffset = data.count
+                        emittedData = true
+                    }
+
+                    if wantStderr,
+                        let stderrHandle,
+                        let data = try? stderrHandle.readToEnd(),
+                        data.count > stderrOffset
+                    {
+                        emit(data.subdata(in: stderrOffset..<data.count), streamType: .stderr)
+                        stderrOffset = data.count
+                        emittedData = true
+                    }
+
+                    if emittedData {
+                        idlePolls = 0
+                    } else {
+                        idlePolls += 1
+                    }
+
+                    if idlePolls < idlePollLimit {
+                        try? await Swift.Task.sleep(nanoseconds: pollInterval)
+                    }
+                }
+            }
+        }
+
+        return Response(
+            status: .ok,
+            headers: ["Content-Type": contentType],
+            body: body
+        )
+    }
+
+    private static func handleAttachToStoppedContainer(
         req: Request,
         client: ClientContainerProtocol,
         container: ContainerSnapshot,
@@ -232,21 +482,40 @@ extension ContainerAttachRoute {
         hasConnectionUpgrade: Bool,
         isTTY: Bool
     ) async throws -> Response {
-
         let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
         let upgradeHeader = req.headers.first(name: "Upgrade")?.lowercased()
         let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
         guard let currentContainer = try await client.getContainer(id: container.id) else {
-            throw Abort(.notFound, reason: "Container not found")
+            throw Abort(.notFound, reason: "No such container: \(container.id)")
         }
 
-        // NOTE: For true docker run -it behavior, we need to control the main process stdio,
-        //       this means we need to bootstrap the container with our own pipes
-        // WARN: docker compose reaches this logic
+        // For stopped containers we need to control the main process stdio
+        // ourselves, otherwise short-lived commands may exit before their
+        // output becomes visible through the logs API.
         guard currentContainer.status == .stopped else {
-            throw Abort(.conflict, reason: "Container is in \(currentContainer.status) state and cannot be attached to")
+            throw Abort(.internalServerError, reason: "Failed to attach stdin to container in \(currentContainer.status) state")
         }
+
+        if !(query.logs ?? false) && !(query.stream ?? false) {
+            var headers = HTTPHeaders()
+            headers.replaceOrAdd(name: .contentType, value: "application/vnd.docker.raw-stream")
+            if isUpgrade || hasConnectionUpgrade {
+                headers.replaceOrAdd(name: .connection, value: "Upgrade")
+                headers.replaceOrAdd(name: .upgrade, value: "tcp")
+                return Response(status: .switchingProtocols, headers: headers, body: .empty)
+            }
+            return Response(status: .ok, headers: headers, body: .empty)
+        }
+
+        if (query.logs ?? false) && !(query.stream ?? false) {
+            return try await replayStoppedContainerLogs(
+                container: currentContainer,
+                query: query,
+                isTTY: isTTY
+            )
+        }
+
         return try await createContainerForAttachment(
             req: req,
             client: client,
@@ -255,6 +524,71 @@ extension ContainerAttachRoute {
             shouldUpgrade: shouldUpgrade,
             isTTY: isTTY
         )
+    }
+
+    private static func replayStoppedContainerLogs(
+        container: ContainerSnapshot,
+        query: ContainerAttachQuery,
+        isTTY: Bool
+    ) async throws -> Response {
+        let wantStdout = query.stdout ?? true
+        let wantStderr = query.stderr ?? !isTTY
+        let (stdoutHandle, stderrHandle) = openStoppedContainerLogHandles(containerID: container.id)
+
+        let contentType = "application/vnd.docker.raw-stream"
+        let body = Response.Body { writer in
+            Swift.Task.detached {
+                defer {
+                    try? stdoutHandle?.close()
+                    try? stderrHandle?.close()
+                    _ = writer.write(.end)
+                }
+
+                func writeLogData(_ data: Data, streamType: DockerStreamFrame.StreamType) {
+                    guard !data.isEmpty else { return }
+                    let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
+                    var buffer = sharedAllocator.buffer(capacity: capacity)
+                    buffer.writeDockerFrame(streamType: streamType, data: data, ttyMode: isTTY)
+                    _ = writer.write(.buffer(buffer))
+                }
+
+                if wantStdout, let stdoutHandle, let data = try? stdoutHandle.readToEnd() {
+                    writeLogData(data, streamType: .stdout)
+                }
+
+                if wantStderr, let stderrHandle, let data = try? stderrHandle.readToEnd() {
+                    writeLogData(data, streamType: .stderr)
+                }
+            }
+        }
+
+        return Response(
+            status: .ok,
+            headers: ["Content-Type": contentType],
+            body: body
+        )
+    }
+
+    private static func openStoppedContainerLogHandles(containerID: String) -> (FileHandle?, FileHandle?) {
+        let root = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Library/Application Support/com.apple.container/containers", isDirectory: true)
+        let bundle = ContainerResource.Bundle(path: root.appendingPathComponent(containerID, isDirectory: true))
+        let fileManager = FileManager.default
+
+        // Apple's logs API fails if either log file is missing. For never-started
+        // containers there may be no stdio.log yet, so attach+logs should degrade
+        // to an empty replay instead of surfacing that Apple backend limitation as
+        // a 500 from Docker's attach route.
+        let stdoutHandle =
+            fileManager.fileExists(atPath: bundle.containerLog.path)
+            ? try? FileHandle(forReadingFrom: bundle.containerLog)
+            : nil
+        let stderrHandle =
+            fileManager.fileExists(atPath: bundle.bootlog.path)
+            ? try? FileHandle(forReadingFrom: bundle.bootlog)
+            : nil
+
+        return (stdoutHandle, stderrHandle)
     }
 
     // Handle attachment to stopped containers by bootstrapping with our stdio
@@ -266,17 +600,22 @@ extension ContainerAttachRoute {
         shouldUpgrade: Bool,
         isTTY: Bool
     ) async throws -> Response {
+        guard let attachSessionManager = req.application.storage[StoppedContainerAttachSessionManagerKey.self] else {
+            throw Abort(.internalServerError, reason: "Stopped container attach session manager not configured")
+        }
 
+        let attachStdin = (query.stdin ?? false) && containerOpenStdin(container)
         let attachStdout = query.stdout ?? true
         let attachStderr = query.stderr ?? !isTTY
+        let shouldAutoStart = query.stream ?? false
 
         // Create pipes for bidirectional communication with the main process
-        let stdinPipe: Pipe = Pipe()
+        let stdinPipe: Pipe? = attachStdin ? Pipe() : nil
         let stdoutPipe: Pipe? = attachStdout ? Pipe() : nil
         let stderrPipe: Pipe? = (attachStderr && !isTTY) ? Pipe() : nil
 
         let stdio = [
-            stdinPipe.fileHandleForReading,
+            stdinPipe?.fileHandleForReading,
             stdoutPipe?.fileHandleForWriting,
             stderrPipe?.fileHandleForWriting,
         ]
@@ -288,100 +627,156 @@ extension ContainerAttachRoute {
             throw Abort(.internalServerError, reason: "Failed to bootstrap container: \(error.localizedDescription)")
         }
 
-        do {
-            try await process.start()
-        } catch {
-            throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
+        let session = await attachSessionManager.prepare(
+            containerID: container.id,
+            runtime: container.configuration.runtimeHandler,
+            process: process,
+            stdinPipe: stdinPipe,
+            stdoutPipe: stdoutPipe,
+            stderrPipe: stderrPipe
+        )
+
+        if shouldAutoStart, let broadcaster = req.eventBroadcaster {
+            let eventLabels = SocktainerContainerMetadata.userVisibleLabels(from: container.configuration.labels)
+            let containerName = container.configuration.labels[SocktainerContainerMetadata.containerNameLabel] ?? container.id
+            let networkContext = await resolveEventNetworkContext(for: container, logger: req.logger)
+
+            await broadcaster.broadcast(
+                DockerEvent.simpleEvent(
+                    id: container.id,
+                    type: "container",
+                    status: "attach",
+                    from: container.configuration.image.reference,
+                    name: containerName,
+                    image: container.configuration.image.reference,
+                    labels: eventLabels
+                )
+            )
+            if let networkContext {
+                await broadcaster.broadcast(
+                    networkLifecycleEvent(
+                        network: networkContext,
+                        action: "connect",
+                        containerID: container.id
+                    )
+                )
+            }
+            await broadcaster.broadcast(
+                DockerEvent.simpleEvent(
+                    id: container.id,
+                    type: "container",
+                    status: "start",
+                    from: container.configuration.image.reference,
+                    name: containerName,
+                    image: container.configuration.image.reference,
+                    labels: eventLabels
+                )
+            )
         }
 
         guard shouldUpgrade else {
-
-            return ConnectionHijackingMiddleware.createDockerStreamingResponse(
+            return DockerPlainStreamingResponse.create(
                 request: req,
-                ttyEnabled: isTTY
+                ttyEnabled: isTTY,
+                nonTTYContentType: "application/vnd.docker.raw-stream"
             ) { streamContinuation in
+                DockerStreamRuntime.installReadabilityHandler(
+                    on: stdoutPipe?.fileHandleForReading,
+                    streamType: .stdout,
+                    tty: isTTY,
+                    allocator: sharedAllocator,
+                    onChunk: { streamContinuation.yield($0) },
+                    onEOF: {}
+                )
+
+                DockerStreamRuntime.installReadabilityHandler(
+                    on: stderrPipe?.fileHandleForReading,
+                    streamType: .stderr,
+                    tty: isTTY,
+                    allocator: sharedAllocator,
+                    onChunk: { streamContinuation.yield($0) },
+                    onEOF: {}
+                )
 
                 await withTaskGroup(of: Void.self) { group in
-                    // Process monitor - when process exits, close pipes and finish stream
+                    let autoStartBeganAt = shouldAutoStart ? Date() : nil
+                    let networkContext = shouldAutoStart ? await resolveEventNetworkContext(for: container, logger: req.logger) : nil
+
+                    group.addTask {
+                        guard shouldAutoStart else {
+                            return
+                        }
+                        do {
+                            try await attachSessionManager.start(containerID: container.id)
+                        } catch {
+                            streamContinuation.finish(throwing: error)
+                        }
+                    }
+
                     group.addTask {
                         defer {
-                            // Close pipes to break the reader loops
-                            try? stdoutPipe?.fileHandleForWriting.close()
-                            try? stderrPipe?.fileHandleForWriting.close()
-                            try? stdinPipe.fileHandleForWriting.close()
-
-                            // Close stream
+                            session.closeClientHandles()
+                            Swift.Task {
+                                await attachSessionManager.remove(containerID: container.id)
+                            }
                             streamContinuation.finish()
                         }
 
-                        do {
-                            let _ = try await process.wait()
-                        } catch {
+                        let exitCode = await session.waitForExit()
+                        await attachSessionManager.markCompleted(containerID: container.id, exitCode: exitCode)
+                        if let broadcaster = req.eventBroadcaster {
+                            let eventLabels = SocktainerContainerMetadata.userVisibleLabels(from: container.configuration.labels)
+                            let containerName = container.configuration.labels[SocktainerContainerMetadata.containerNameLabel] ?? container.id
+                            var dieLabels = eventLabels
+                            if let autoStartBeganAt {
+                                dieLabels["execDuration"] = String(max(0, Int(Date().timeIntervalSince(autoStartBeganAt))))
+                            }
+                            if containerAutoRemove(container), let networkContext {
+                                await broadcaster.broadcast(
+                                    networkLifecycleEvent(
+                                        network: networkContext,
+                                        action: "disconnect",
+                                        containerID: container.id
+                                    )
+                                )
+                            }
+                            let event = DockerEvent.simpleEvent(
+                                id: container.id,
+                                type: "container",
+                                status: "die",
+                                from: container.configuration.image.reference,
+                                name: containerName,
+                                image: container.configuration.image.reference,
+                                exitCode: String(exitCode),
+                                labels: dieLabels
+                            )
+                            await broadcaster.broadcast(event)
+                            if containerAutoRemove(container) {
+                                await broadcaster.broadcast(
+                                    DockerEvent.simpleEvent(
+                                        id: container.id,
+                                        type: "container",
+                                        status: "destroy",
+                                        from: container.configuration.image.reference,
+                                        name: containerName,
+                                        image: container.configuration.image.reference,
+                                        labels: eventLabels
+                                    )
+                                )
+                            }
                         }
+
+                        DockerStreamRuntime.emitTrailingOutput(
+                            stdout: session.stdoutReader,
+                            stderr: session.stderrReader,
+                            tty: isTTY,
+                            emit: { streamContinuation.yield($0) }
+                        )
                     }
 
-                    if let stdoutHandle = stdoutPipe?.fileHandleForReading {
+                    if let stdinWriter = session.stdinWriter {
                         group.addTask {
-                            defer {
-                                try? stdoutHandle.close()
-                            }
-
-                            while true {
-                                do {
-                                    guard let data = try stdoutHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
-                                    }
-
-                                    let capacity = min(data.count + (isTTY ? 0 : 8), 65536)  // Cap buffer size
-                                    var buffer = sharedAllocator.buffer(capacity: capacity)
-                                    buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
-                                    streamContinuation.yield(buffer)
-                                } catch {
-                                    break
-                                }
-                            }
-                        }
-                    }
-
-                    if let stderrHandle = stderrPipe?.fileHandleForReading {
-                        group.addTask {
-                            defer {
-                                try? stderrHandle.close()
-                            }
-
-                            while true {
-                                do {
-                                    guard let data = try stderrHandle.read(upToCount: 8192), !data.isEmpty else {
-                                        try await Task.sleep(nanoseconds: 20_000_000)  // 20ms
-                                        continue
-                                    }
-
-                                    let capacity = min(data.count + 8, 65536)  // Cap buffer size
-                                    var buffer = sharedAllocator.buffer(capacity: capacity)
-                                    buffer.writeDockerFrame(streamType: .stderr, data: data, ttyMode: isTTY)
-                                    streamContinuation.yield(buffer)
-                                } catch {
-                                    break
-                                }
-                            }
-                        }
-                    }
-
-                    let stdinWriter = stdinPipe.fileHandleForWriting
-                    group.addTask {
-                        defer {
-                            try? stdinWriter.close()
-                        }
-
-                        do {
-                            for try await var buf in req.body {
-                                if let data = buf.readData(length: buf.readableBytes) {
-                                    try stdinWriter.write(contentsOf: data)
-                                    try stdinWriter.synchronize()
-                                }
-                            }
-                        } catch {
+                            await DockerStreamRuntime.forwardBody(req.body, to: stdinWriter)
                         }
                     }
 
@@ -390,178 +785,113 @@ extension ContainerAttachRoute {
             }
         }
 
-        return Response.dockerTCPUpgrade(
-            execId: container.id,
+        return Response.dockerRawStreamUpgrade(
             ttyEnabled: isTTY
         ) { channel, tcpHandler in
+            let writeState = DockerUpgradeWriteState()
+            let closeState = DockerUpgradeCloseState(configuredStreams: [session.stdoutReader, session.stderrReader].compactMap { $0 }.count)
 
-            tcpHandler.setStdinWriter(stdinPipe.fileHandleForWriting)
+            tcpHandler.setStdinWriter(session.stdinWriter)
+            tcpHandler.setCloseStdinOnInactive(false)
+
+            DockerStreamRuntime.installUpgradedReadabilityHandler(
+                on: session.stdoutReader,
+                streamType: .stdout,
+                tty: isTTY,
+                channel: channel,
+                writeState: writeState,
+                closeState: closeState,
+                onEOF: {
+                }
+            )
+
+            DockerStreamRuntime.installUpgradedReadabilityHandler(
+                on: session.stderrReader,
+                streamType: .stderr,
+                tty: isTTY,
+                channel: channel,
+                writeState: writeState,
+                closeState: closeState,
+                onEOF: {
+                }
+            )
 
             await withTaskGroup(of: Void.self) { group in
-                if let stdoutHandle = stdoutPipe?.fileHandleForReading {
-                    group.addTask {
-                        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                            let dispatchIO = DispatchIO(
-                                type: .stream,
-                                fileDescriptor: stdoutHandle.fileDescriptor,
-                                queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { error in
-                                continuation.resume()
-                            }
-
-                            dispatchIO.setLimit(lowWater: 1)
-                            dispatchIO.setLimit(highWater: 8192)
-
-                            let state = DockerConnectionState()
-
-                            @Sendable func readNextChunk() {
-                                dispatchIO.read(
-                                    offset: off_t.max,
-                                    length: 8192,
-                                    queue: DispatchQueue.global(qos: .userInteractive)
-                                ) { done, data, error in
-                                    guard !done || error == 0 else {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                        return
-                                    }
-                                    guard let data = data else {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                        return
-                                    }
-                                    guard !data.isEmpty || !done else {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                        return
-                                    }
-
-                                    if !data.isEmpty {
-                                        channel.eventLoop.execute {
-                                            let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
-                                            var outputBuffer = channel.allocator.buffer(capacity: capacity)
-                                            if isTTY {
-                                                outputBuffer.writeBytes(data)
-                                            } else {
-                                                outputBuffer.writeDockerFrame(streamType: .stdout, data: Data(data), ttyMode: false)
-                                            }
-                                            _ = channel.writeAndFlush(outputBuffer)
-                                        }
-                                    }
-
-                                    if done && !state.shouldStop() {
-                                        DispatchQueue.global(qos: .userInteractive).async {
-                                            readNextChunk()
-                                        }
-                                    }
-                                }
-                            }
-
-                            readNextChunk()
-                        }
-
-                        try? stdoutHandle.close()
-                    }
-                }
-
-                if let stderrHandle = stderrPipe?.fileHandleForReading {
-                    group.addTask {
-                        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                            let dispatchIO = DispatchIO(
-                                type: .stream,
-                                fileDescriptor: stderrHandle.fileDescriptor,
-                                queue: DispatchQueue.global(qos: .userInteractive)
-                            ) { error in
-                                continuation.resume()
-                            }
-
-                            dispatchIO.setLimit(lowWater: 1)
-                            dispatchIO.setLimit(highWater: 8192)
-
-                            let state = DockerConnectionState()
-
-                            @Sendable func readNextChunk() {
-                                dispatchIO.read(
-                                    offset: off_t.max,
-                                    length: 8192,
-                                    queue: DispatchQueue.global(qos: .userInteractive)
-                                ) { done, data, error in
-                                    guard !done || error == 0 else {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                        return
-                                    }
-                                    guard let data = data else {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                        return
-                                    }
-                                    guard !data.isEmpty || !done else {
-                                        state.finish {
-                                            dispatchIO.close()
-                                        }
-                                        return
-                                    }
-
-                                    if !data.isEmpty {
-                                        channel.eventLoop.execute {
-                                            let capacity = min(data.count + (isTTY ? 0 : 8), 65536)
-                                            var outputBuffer = channel.allocator.buffer(capacity: capacity)
-                                            if isTTY {
-                                                outputBuffer.writeBytes(data)
-                                            } else {
-                                                outputBuffer.writeDockerFrame(streamType: .stderr, data: Data(data), ttyMode: false)
-                                            }
-                                            _ = channel.writeAndFlush(outputBuffer)
-                                        }
-                                    }
-
-                                    if done && !state.shouldStop() {
-                                        DispatchQueue.global(qos: .userInteractive).async {
-                                            readNextChunk()
-                                        }
-                                    }
-                                }
-                            }
-
-                            readNextChunk()
-                        }
-
-                        try? stderrHandle.close()
-                    }
-                }
+                let autoStartBeganAt = shouldAutoStart ? Date() : nil
+                let networkContext = shouldAutoStart ? await resolveEventNetworkContext(for: container, logger: req.logger) : nil
 
                 group.addTask {
-                    let maxWaits = 6000  // 10 minutes max (6000 * 100ms)
-                    for _ in 0..<maxWaits {
-                        guard channel.isActive else { break }
-                        try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                    guard shouldAutoStart else {
+                        return
                     }
-                }
-
-                group.addTask {
                     do {
-                        let _ = try await process.wait()
+                        try await attachSessionManager.start(containerID: container.id)
                     } catch {
+                        closeState.markProcessExited()
+                        DockerStreamRuntime.requestCloseIfPossible(channel: channel, writeState: writeState, closeState: closeState)
+                    }
+                }
+
+                group.addTask {
+                    defer {
+                        session.closeClientHandles()
+                        Swift.Task {
+                            await attachSessionManager.remove(containerID: container.id)
+                        }
                     }
 
-                    // Give a small delay for any final output to be processed
-                    try? await Task.sleep(nanoseconds: 200_000_000)  // 200ms
-
-                    // Close all pipes to signal EOF to readers
-                    try? stdoutPipe?.fileHandleForWriting.close()
-                    try? stderrPipe?.fileHandleForWriting.close()
-                    try? stdinPipe.fileHandleForWriting.close()
-
-                    // Close the channel gracefully
-                    _ = channel.eventLoop.submit {
-                        channel.close(promise: nil)
+                    let exitCode = await session.waitForExit()
+                    await attachSessionManager.markCompleted(containerID: container.id, exitCode: exitCode)
+                    if let broadcaster = req.eventBroadcaster {
+                        let eventLabels = SocktainerContainerMetadata.userVisibleLabels(from: container.configuration.labels)
+                        let containerName = container.configuration.labels[SocktainerContainerMetadata.containerNameLabel] ?? container.id
+                        var dieLabels = eventLabels
+                        if let autoStartBeganAt {
+                            dieLabels["execDuration"] = String(max(0, Int(Date().timeIntervalSince(autoStartBeganAt))))
+                        }
+                        if containerAutoRemove(container), let networkContext {
+                            await broadcaster.broadcast(
+                                networkLifecycleEvent(
+                                    network: networkContext,
+                                    action: "disconnect",
+                                    containerID: container.id
+                                )
+                            )
+                        }
+                        let event = DockerEvent.simpleEvent(
+                            id: container.id,
+                            type: "container",
+                            status: "die",
+                            from: container.configuration.image.reference,
+                            name: containerName,
+                            image: container.configuration.image.reference,
+                            exitCode: String(exitCode),
+                            labels: dieLabels
+                        )
+                        await broadcaster.broadcast(event)
+                        if containerAutoRemove(container) {
+                            await broadcaster.broadcast(
+                                DockerEvent.simpleEvent(
+                                    id: container.id,
+                                    type: "container",
+                                    status: "destroy",
+                                    from: container.configuration.image.reference,
+                                    name: containerName,
+                                    image: container.configuration.image.reference,
+                                    labels: eventLabels
+                                )
+                            )
+                        }
                     }
+                    await DockerStreamRuntime.emitTrailingOutputToChannel(
+                        stdout: session.stdoutReader,
+                        stderr: session.stderrReader,
+                        tty: isTTY,
+                        channel: channel,
+                        closeState: closeState
+                    )
+                    closeState.markProcessExited()
+                    DockerStreamRuntime.requestCloseIfPossible(channel: channel, writeState: writeState, closeState: closeState)
                 }
 
                 for await _ in group {}

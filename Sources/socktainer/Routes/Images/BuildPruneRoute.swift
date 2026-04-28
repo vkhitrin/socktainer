@@ -1,29 +1,6 @@
 import Foundation
 import Vapor
 
-struct RESTBuildPruneQuery: Content {
-    let filters: String?
-    let all: Bool?
-    let keepStorage: Int64?
-    let reservedSpace: Int64?
-    let maxUsedSpace: Int64?
-    let minFreeSpace: Int64?
-
-    enum CodingKeys: String, CodingKey {
-        case filters
-        case all
-        case keepStorage = "keep-storage"
-        case reservedSpace = "reserved-space"
-        case maxUsedSpace = "max-used-space"
-        case minFreeSpace = "min-free-space"
-    }
-}
-
-struct RESTBuildPruneResponse: Content {
-    let CachesDeleted: [String]?
-    let SpaceReclaimed: Int64
-}
-
 struct BuildPruneRoute: RouteCollection {
     let builderClient: ClientBuilderProtocol
 
@@ -35,10 +12,25 @@ struct BuildPruneRoute: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/build/prune", use: handler)
     }
 
-    func handler(_ req: Request) async throws -> RESTBuildPruneResponse {
-        let query = try req.query.decode(RESTBuildPruneQuery.self)
+    func handler(_ req: Request) async throws -> Response {
+        let query = try req.query.decode(BuildPruneQuery.self)
+        if let keepStorage = query.keepStorage, keepStorage < 0 {
+            throw Abort(.badRequest, reason: "keep-storage must be non-negative")
+        }
+        if let reservedSpace = query.reservedSpace, reservedSpace < 0 {
+            throw Abort(.badRequest, reason: "reserved-space must be non-negative")
+        }
+        if let maxUsedSpace = query.maxUsedSpace, maxUsedSpace < 0 {
+            throw Abort(.badRequest, reason: "max-used-space must be non-negative")
+        }
+        if let minFreeSpace = query.minFreeSpace, minFreeSpace < 0 {
+            throw Abort(.badRequest, reason: "min-free-space must be non-negative")
+        }
         let logger = req.logger
-        let parsedFilters = try DockerBuildFilterUtility.parseBuildPruneFilters(filtersParam: query.filters, logger: logger)
+        let parsedFilters = try DockerBuildFilterUtility.parseBuildPruneFilters(
+            filtersParam: query.filters,
+            logger: logger
+        )
 
         do {
             let result = try await builderClient.prune(
@@ -53,11 +45,15 @@ struct BuildPruneRoute: RouteCollection {
                 logger: logger
             )
 
-            return RESTBuildPruneResponse(
-                CachesDeleted: result.deletedCaches.isEmpty ? nil : result.deletedCaches,
-                SpaceReclaimed: result.spaceReclaimed
-            )
+            let payload: [String: Any] = [
+                "CachesDeleted": result.deletedCaches.isEmpty ? NSNull() : result.deletedCaches,
+                "SpaceReclaimed": result.spaceReclaimed,
+            ]
+            return try JSONResponseUtility.response(object: payload)
         } catch {
+            if let abort = error as? AbortError {
+                throw abort
+            }
             logger.error("Failed to prune build cache via buildctl: \(error)")
             throw Abort(.internalServerError, reason: "Failed to prune build cache: \(error.localizedDescription)")
         }

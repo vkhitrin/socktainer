@@ -1,3 +1,4 @@
+import ContainerAPIClient
 import Foundation
 import Vapor
 
@@ -9,95 +10,98 @@ struct ImagesLoadRoute: RouteCollection {
     }
 }
 
-struct RESTImageLoadQuery: Content {
-    let quiet: Bool?
-    let platform: String?
-}
-
 extension ImagesLoadRoute {
+    private static func errorResponse(_ reason: String) -> Response {
+        let response = Response(status: .internalServerError)
+        response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        response.body = .init(string: "{\"message\":\(reason.debugDescription)}\n")
+        return response
+    }
+
     static func handler(client: ClientImageProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
-            let query = try req.query.decode(RESTImageLoadQuery.self)
+            let query = try req.query.decode(ImageLoadQuery.self)
             let quiet = query.quiet ?? false
 
-            let platform: Platform
+            let platform: Platform?
             if let platformString = query.platform, !platformString.isEmpty {
-                do {
-                    platform = try platformOrThrow(platformString)
-                } catch {
-                    let response = Response(status: .badRequest)
-                    response.headers.add(name: .contentType, value: "application/json")
-                    response.body = .init(string: "{\"message\": \"Failed to parse platform\"}\n")
-                    return response
-                }
+                platform = try platformOrThrow(platformString)
             } else {
-                platform = currentPlatform()
+                platform = nil
             }
 
-            let response = Response()
-            response.headers.add(name: .contentType, value: "application/json")
+            if let contentType = req.headers.first(name: .contentType) {
+                let normalized = contentType.lowercased()
+                if !normalized.hasPrefix("application/x-tar")
+                    && !normalized.hasPrefix("application/octet-stream")
+                {
+                    throw Abort(.badRequest, reason: "Content-Type must be application/x-tar or application/octet-stream")
+                }
+            }
 
-            response.body = .init(stream: { writer in
-                Task {
-                    do {
-                        let bodyBuffer: ByteBuffer
-                        if let data = req.body.data {
-                            bodyBuffer = data
-                        } else {
-                            var collectedBuffer = ByteBufferAllocator().buffer(capacity: 0)
-                            for try await chunk in req.body {
-                                var chunkBuffer = chunk
-                                collectedBuffer.writeBuffer(&chunkBuffer)
-                            }
-                            bodyBuffer = collectedBuffer
-                        }
+            guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
+                return errorResponse("AppleContainerAppSupportUrl not configured")
+            }
 
-                        guard bodyBuffer.readableBytes > 0 else {
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"message\": \"Request body is required\"}\n")))
-                            _ = writer.write(.end)
-                            return
-                        }
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer {
+                try? FileManager.default.removeItem(at: tempDir)
+            }
 
-                        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-                        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            let tarPath = tempDir.appendingPathComponent("images.tar")
+            try await RequestBodyFileUtility.writeRequestBody(
+                req,
+                to: tarPath,
+                failureReason: "Failed to process image load upload"
+            )
 
-                        defer {
-                            try? FileManager.default.removeItem(at: tempDir)
-                        }
+            do {
+                var responseLines: [String] = []
 
-                        let tarPath = tempDir.appendingPathComponent("images.tar")
-                        try Data(buffer: bodyBuffer).write(to: tarPath)
+                let loadedImages = try await client.load(
+                    tarballPath: tarPath,
+                    platform: platform,
+                    appleContainerAppSupportUrl: appleContainerAppSupportUrl,
+                    importMessage: nil,
+                    importChanges: [],
+                    logger: req.logger
+                )
 
-                        guard let appleContainerAppSupportUrl = req.application.storage[AppleContainerAppSupportUrlKey.self] else {
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"AppleContainerAppSupportUrl not configured\"}\n")))
-                            _ = writer.write(.end)
-                            return
-                        }
-
-                        if !quiet {
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"status\": \"Loading images from tarball\"}\n")))
-                        }
-
-                        let loadedImages = try await client.load(
-                            tarballPath: tarPath, platform: platform, appleContainerAppSupportUrl: appleContainerAppSupportUrl, logger: req.logger)
-
-                        for image in loadedImages {
-                            if !quiet {
-                                _ = writer.write(.buffer(ByteBuffer(string: "{\"status\": \"Loaded image \(image)\"}\n")))
-                            }
-                            _ = writer.write(.buffer(ByteBuffer(string: "{\"stream\": \"Loaded image: \(image)\"}\n")))
-                        }
-
-                        _ = writer.write(.end)
-                    } catch {
-                        req.logger.error("Failed to load images: \(error)")
-                        _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
-                        _ = writer.write(.error(error))
+                for image in loadedImages {
+                    // Docker still emits a "Loaded image: ..." stream record here
+                    // even when the request carries `quiet=1`, so keep the user-
+                    // visible response aligned with the engine instead of treating
+                    // `quiet` as a hard suppression toggle.
+                    _ = quiet
+                    responseLines.append("{\"stream\":\"Loaded image: \(image)\\n\"}")
+                    if let broadcaster = req.eventBroadcaster {
+                        let resolvedImage = try? await ClientImage.get(reference: image)
+                        let imageLabels = try? await resolvedImage?.config(for: currentPlatform()).config?.labels
+                        let event = DockerEvent.simpleEvent(
+                            id: resolvedImage?.digest ?? image,
+                            type: "image",
+                            status: "load",
+                            from: resolvedImage?.reference ?? image,
+                            name: image,
+                            image: resolvedImage?.reference ?? image,
+                            labels: imageLabels ?? [:]
+                        )
+                        await broadcaster.broadcast(event)
                     }
                 }
-            })
 
-            return response
+                let response = Response(status: .ok)
+                response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+                response.body = .init(string: responseLines.joined(separator: "\n") + (responseLines.isEmpty ? "" : "\n"))
+                return response
+            } catch {
+                if let abort = error as? AbortError {
+                    throw abort
+                }
+                req.logger.error("Failed to load images: \(error)")
+                return errorResponse(error.localizedDescription)
+            }
         }
     }
 }

@@ -1,83 +1,174 @@
 import Foundation
 import Vapor
 
+private func validateBooleanFilterValues(_ values: [String], key: String) throws {
+    let supported: Set<String> = ["1", "0", "true", "false"]
+    for value in values where !supported.contains(value.lowercased()) {
+        throw Abort(.badRequest, reason: "Invalid \(key) filter value: \(value)")
+    }
+}
+
+private func validateBooleanFilterKeys(_ values: [String], key: String, keys: Set<String>) throws {
+    guard keys.contains(key) else {
+        return
+    }
+    try validateBooleanFilterValues(values, key: key)
+}
+
+private func validateUntilFilterValues(_ values: [String]) throws {
+    for untilValue in values where DockerBuildFilterUtility.parseUntilFilter(untilValue) == nil {
+        throw Abort(.badRequest, reason: "Invalid until filter value: \(untilValue)")
+    }
+}
+
+private func decodeFilterJSONObject(
+    _ filtersParam: String?,
+    logger: Logger,
+    failureReason: String
+) throws -> [String: Any]? {
+    guard let filtersParam, let data = filtersParam.data(using: .utf8) else {
+        return nil
+    }
+    guard let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
+        logger.warning("Failed to decode filters")
+        throw Abort(.badRequest, reason: failureReason)
+    }
+    return decoded
+}
+
+private func validateFilterKeys(
+    _ keys: Set<String>,
+    allowedKeys: Set<String>,
+    logger: Logger
+) throws {
+    guard keys.isSubset(of: allowedKeys) else {
+        let invalidKeys = keys.subtracting(allowedKeys)
+        logger.warning("Invalid filter key(s) found: \(invalidKeys)")
+        throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(invalidKeys)")
+    }
+}
+
+private func coerceFilterValues(_ value: Any, key: String) throws -> (values: [String], shouldStore: Bool) {
+    if let dict = value as? [String: Any] {
+        let values = dict.compactMap { rawKey, rawValue in
+            (rawValue as? Bool == true) ? rawKey : nil
+        }
+        return (values, !values.isEmpty)
+    }
+    if let arr = value as? [String] {
+        return (arr, true)
+    }
+    if let str = value as? String {
+        return ([str], true)
+    }
+    throw Abort(.badRequest, reason: "Invalid filter value for key \(key)")
+}
+
+private func parseFilterMap(
+    _ filtersParam: String?,
+    logger: Logger,
+    failureReason: String,
+    allowedKeys: Set<String>,
+    transform: (_ key: String, _ values: [String]) throws -> [String]
+) throws -> [String: [String]] {
+    guard let filters = try decodeFilterJSONObject(filtersParam, logger: logger, failureReason: failureReason) else {
+        return [:]
+    }
+
+    try validateFilterKeys(Set(filters.keys), allowedKeys: allowedKeys, logger: logger)
+
+    var parsedFilters: [String: [String]] = [:]
+    for (key, value) in filters {
+        let (values, shouldStore) = try coerceFilterValues(value, key: key)
+        guard shouldStore else {
+            continue
+        }
+        parsedFilters[key] = try transform(key, values)
+    }
+    return parsedFilters
+}
+
 // utility for parsing network filters from query string
 struct DockerNetworkFilterUtility {
     // parses network filters from a query string, optionally defaulting to dangling only
     // dangling networks are networks with no containers are attached to them
     static func parseNetworkFilters(filtersParam: String?, defaultDangling: Bool, logger: Logger) throws -> [String: [String]] {
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-
-                // Validate keys
-                let allowedKeys: Set<String> = ["name", "id", "label", "dangling"]
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
-
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (key, value) in
-                            (value as? Bool == true) ? key : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
+        let allowedKeys: Set<String> = ["name", "id", "label", "dangling", "driver", "scope", "type"]
+        let parsedFilters = try parseFilterMap(
+            filtersParam,
+            logger: logger,
+            failureReason: "Failed to decode network filters",
+            allowedKeys: allowedKeys
+        ) { key, values in
+            if key == "dangling" {
+                try validateBooleanFilterValues(values, key: key)
             }
-        } else if defaultDangling {
-            parsedFilters["dangling"] = ["true"]
-            logger.debug("No filters provided, defaulting to prune only dangling networks.")
+            if key == "type" {
+                let supportedTypes: Set<String> = ["custom", "builtin"]
+                for type in values where !supportedTypes.contains(type) {
+                    throw Abort(.badRequest, reason: "Invalid type filter value: \(type)")
+                }
+            }
+            return values
         }
+
+        if !parsedFilters.isEmpty {
+            logger.debug("Decoded filters: \(parsedFilters)")
+            return parsedFilters
+        }
+
+        if defaultDangling {
+            logger.debug("No filters provided, defaulting to prune only dangling networks.")
+            return ["dangling": ["true"]]
+        }
+
         return parsedFilters
     }
 }
 
 // utility for parsing container filters from query string
 struct DockerContainerFilterUtility {
+    private static let supportedContainerStatuses: Set<String> = [
+        "created",
+        "restarting",
+        "running",
+        "removing",
+        "paused",
+        "exited",
+        "dead",
+    ]
+
+    private static func validateContainerListFilterValues(_ values: [String], key: String) throws {
+        switch key {
+        case "status":
+            for status in values where !supportedContainerStatuses.contains(status) {
+                throw Abort(.badRequest, reason: "Unsupported container status filter: \(status)")
+            }
+        case "exited":
+            for value in values where Int(value) == nil {
+                throw Abort(.badRequest, reason: "Invalid exited filter value: \(value)")
+            }
+        default:
+            break
+        }
+    }
+
     static func parseContainerPruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         let allowedKeys: Set<String> = ["until", "label"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+        let parsedFilters = try parseFilterMap(
+            filtersParam,
+            logger: logger,
+            failureReason: "Failed to decode container prune filters",
+            allowedKeys: allowedKeys
+        ) { key, values in
+            if key == "until" {
+                for untilValue in values where DockerBuildFilterUtility.parseUntilFilter(untilValue) == nil {
+                    throw Abort(.badRequest, reason: "Invalid until filter value: \(untilValue)")
                 }
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (k, v) in
-                            (v as? Bool == true) ? k : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    } else if let str = value as? String {
-                        parsedFilters[key] = [str]
-                    }
-                }
-                logger.debug("Decoded container prune filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode container prune filters")
             }
+            return values
         }
+        logger.debug("Decoded container prune filters: \(parsedFilters)")
         return parsedFilters
     }
 
@@ -101,36 +192,21 @@ struct DockerContainerFilterUtility {
             "publish",
             "since",
         ]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
+        let parsedFilters = try parseFilterMap(
+            filtersParam,
+            logger: logger,
+            failureReason: "Failed to decode container filters",
+            allowedKeys: allowedKeys
+        ) { key, values in
+            try validateContainerListFilterValues(values, key: key)
+            if key == "until" {
+                for untilValue in values where DockerBuildFilterUtility.parseUntilFilter(untilValue) == nil {
+                    throw Abort(.badRequest, reason: "Invalid until filter value: \(untilValue)")
                 }
-                for (key, value) in filters {
-                    if key == "label", let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (k, v) in
-                            (v as? Bool == true) ? k : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    } else if let str = value as? String {
-                        parsedFilters[key] = [str]
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
             }
+            return values
         }
+        logger.debug("Decoded filters: \(parsedFilters)")
         return parsedFilters
     }
 }
@@ -139,114 +215,79 @@ struct DockerContainerFilterUtility {
 struct DockerVolumeFilterUtility {
     static func parsePruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         let allowedKeys: Set<String> = ["label", "all"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (key, value) in
-                            (value as? Bool == true) ? key : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
+        let parsedFilters = try parseFilterMap(
+            filtersParam,
+            logger: logger,
+            failureReason: "Failed to decode volume prune filters",
+            allowedKeys: allowedKeys
+        ) { key, values in
+            if key == "all" {
+                try validateBooleanFilterValues(values, key: key)
             }
+            return values
         }
+        logger.debug("Decoded filters: \(parsedFilters)")
         return parsedFilters
     }
 
     static func parseVolumeFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         let allowedKeys: Set<String> = ["name", "driver", "label", "dangling"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: allowedKeys) {
-                    logger.warning("Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(filterKeys.subtracting(allowedKeys))")
-                }
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (key, value) in
-                            (value as? Bool == true) ? key : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    }
-                }
-                logger.debug("Decoded filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode filters")
+        let parsedFilters = try parseFilterMap(
+            filtersParam,
+            logger: logger,
+            failureReason: "Failed to decode volume filters",
+            allowedKeys: allowedKeys
+        ) { key, values in
+            if key == "dangling" {
+                try validateBooleanFilterValues(values, key: key)
             }
+            return values
         }
+        logger.debug("Decoded filters: \(parsedFilters)")
         return parsedFilters
     }
 }
 
 struct DockerImageFilterUtility {
-    static func parseImagePruneFilters(filterParam: String?, logger: Logger) -> [String: [String]] {
-        var parsedFilters: [String: [String]] = [:]
-
-        if let filterParam = filterParam {
-            if let data = filterParam.data(using: .utf8) {
-                do {
-                    // First try to parse as generic JSON to see what we got
-                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        for (key, value) in json {
-                            switch key {
-                            case "dangling", "label", "until":
-                                // Handle dictionary format: {"dangling": {"true": true}}
-                                if let dict = value as? [String: Any] {
-                                    let keys = dict.compactMap { (k, v) in
-                                        (v as? Bool == true) ? k : nil
-                                    }
-                                    if !keys.isEmpty {
-                                        parsedFilters[key] = keys
-                                    }
-                                }
-                                // Handle array format: {"dangling": ["true"]}
-                                else if let arr = value as? [String] {
-                                    parsedFilters[key] = arr
-                                }
-                                // Handle single string: {"dangling": "true"}
-                                else if let str = value as? String {
-                                    parsedFilters[key] = [str]
-                                }
-                            default:
-                                logger.warning("Unknown filter key '\(key)'")
-                            }
-                        }
-                    }
-                } catch {
-                    logger.warning("Failed to decode filters: \(error)")
-                }
-            } else {
-                logger.warning("Failed to convert filter param to data")
+    static func parseImageListFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
+        let allowedKeys: Set<String> = ["before", "dangling", "label", "reference", "since", "until"]
+        return try parseFilterMap(
+            filterParam,
+            logger: logger,
+            failureReason: "Failed to decode image list filters",
+            allowedKeys: allowedKeys
+        ) { key, values in
+            try validateBooleanFilterKeys(values, key: key, keys: ["dangling"])
+            if key == "until" {
+                try validateUntilFilterValues(values)
             }
+            return values
         }
+    }
 
-        return parsedFilters
+    static func parseImagePruneFilters(filterParam: String?, logger: Logger) throws -> [String: [String]] {
+        let allowedKeys: Set<String> = ["dangling", "label", "until"]
+
+        do {
+            return try parseFilterMap(
+                filterParam,
+                logger: logger,
+                failureReason: "Failed to decode image prune filters",
+                allowedKeys: allowedKeys
+            ) { key, values in
+                try validateBooleanFilterKeys(values, key: key, keys: ["dangling"])
+                if key == "until" {
+                    try validateUntilFilterValues(values)
+                }
+                return values
+            }
+        } catch {
+            if let abort = error as? AbortError {
+                throw abort
+            }
+            logger.warning("Failed to decode filters: \(error)")
+            throw Abort(.badRequest, reason: "Failed to decode image prune filters")
+        }
     }
 }
 
@@ -254,41 +295,19 @@ struct DockerImageFilterUtility {
 struct DockerBuildFilterUtility {
     static func parseBuildPruneFilters(filtersParam: String?, logger: Logger) throws -> [String: [String]] {
         let supportedKeys: Set<String> = ["until", "id", "inuse", "parent", "type", "description", "shared", "private"]
-        var filters: [String: Any] = [:]
-        var parsedFilters: [String: [String]] = [:]
-
-        if let filtersParam = filtersParam, let data = filtersParam.data(using: .utf8) {
-            if let decoded = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                filters = decoded
-
-                // Validate keys
-                let filterKeys = Set(filters.keys)
-                if !filterKeys.isSubset(of: supportedKeys) {
-                    let invalid = filterKeys.subtracting(supportedKeys)
-                    logger.warning("Invalid filter key(s) found: \(invalid)")
-                    throw Abort(.badRequest, reason: "Invalid filter key(s) found: \(invalid)")
-                }
-
-                for (key, value) in filters {
-                    if let dict = value as? [String: Any] {
-                        let keys = dict.compactMap { (k, v) in
-                            (v as? Bool == true) ? k : nil
-                        }
-                        if !keys.isEmpty {
-                            parsedFilters[key] = keys
-                        }
-                    } else if let arr = value as? [String] {
-                        parsedFilters[key] = arr
-                    } else if let str = value as? String {
-                        parsedFilters[key] = [str]
-                    }
-                }
-                logger.info("Parsed build prune filters: \(parsedFilters)")
-            } else {
-                logger.warning("Failed to decode build prune filters")
+        let parsedFilters = try parseFilterMap(
+            filtersParam,
+            logger: logger,
+            failureReason: "Failed to decode build prune filters",
+            allowedKeys: supportedKeys
+        ) { key, values in
+            try validateBooleanFilterKeys(values, key: key, keys: ["inuse", "shared", "private"])
+            if key == "until" {
+                try validateUntilFilterValues(values)
             }
+            return values
         }
-
+        logger.info("Parsed build prune filters: \(parsedFilters)")
         return parsedFilters
     }
 

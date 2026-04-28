@@ -1,3 +1,4 @@
+import ContainerizationError
 import Vapor
 
 struct ContainerRestartRoute: RouteCollection {
@@ -7,12 +8,15 @@ struct ContainerRestartRoute: RouteCollection {
     }
 }
 
-struct ContainerRestartQuery: Content {
-    let signal: String?
-    let t: Int?/// Number of seconds to wait before killing the container
-}
-
 extension ContainerRestartRoute {
+    private static func abortForRestartError(_ error: any Error, id: String) -> Abort {
+        ContainerMutationRouteUtility.abort(
+            for: error,
+            containerID: id,
+            operation: "restart"
+        )
+    }
+
     static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> HTTPStatus {
         { req in
             guard let id = req.parameters.get("id") else {
@@ -20,23 +24,23 @@ extension ContainerRestartRoute {
             }
 
             let query = try req.query.decode(ContainerRestartQuery.self)
-            let signal = query.signal
-            let timeout = query.t
+            let signal = try ContainerSignalUtility.validatedSignal(query.signal, action: "restart")
+            let timeout = try ContainerSignalUtility.validatedTimeout(query.t, action: "restart")
+            let container = try await client.getContainer(id: id)
 
             do {
                 try await client.restart(id: id, signal: signal, timeout: timeout)
-            } catch ClientContainerError.notFound {
-                throw Abort(.notFound, reason: "No such container: \(id)")
             } catch {
                 req.logger.error("Failed to restart container \(id): \(error)")
-                throw Abort(.internalServerError, reason: "Failed to restart container: \(error)")
+                throw abortForRestartError(error, id: id)
             }
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-
-            // Broadcast restart event (or both stop and start events)
-            let restartEvent = DockerEvent.simpleEvent(id: id, type: "container", status: "restart")
-            await broadcaster.broadcast(restartEvent)
+            await ContainerEventUtility.broadcastContainerEvent(
+                request: req,
+                status: "restart",
+                container: container,
+                containerID: id
+            )
 
             return .noContent
         }

@@ -1,0 +1,19 @@
+templateDir: Tools/OpenAPIGeneratorTemplates
+additionalProperties:
+  nonPublicApi: "true"
+  useBacktickEscapes: "true"
+  useVapor: "true"
+  validatable: "false"
+modelNameMappings:
+  ErrorResponse: DockerErrorResponse
+  Type: DockerType
+  Protocol: DockerProtocol
+  Platform: DockerPlatform
+  ImageDeleteResponseItem: DockerImageDeleteResponseItem
+typeMappings:
+  Dictionary: "[String: String]"
+files:
+  query_models.mustache:
+    folder: Sources/OpenAPIClient/Models
+    destinationFilename: QueryModels.swift
+    templateType: API

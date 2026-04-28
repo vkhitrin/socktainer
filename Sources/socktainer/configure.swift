@@ -1,3 +1,4 @@
+import ContainerPlugin
 import Vapor
 
 struct AppleContainerAppSupportUrlKey: StorageKey {
@@ -7,8 +8,7 @@ struct AppleContainerAppSupportUrlKey: StorageKey {
 func configure(_ app: Application) async throws {
 
     // Define app support path early since it's needed by multiple services
-    let folderPath = ("\(NSHomeDirectory())/Library/Application Support/com.apple.container")
-    let appleContainerAppSupportUrl = URL(fileURLWithPath: folderPath)
+    let appleContainerAppSupportUrl = ApplicationRoot.url
 
     let containerClient = ClientContainerService()
     let imageClient = ClientImageService()
@@ -17,7 +17,7 @@ func configure(_ app: Application) async throws {
     let volumeClinet = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
-    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl)
+    let builderClient = ClientBuilderService()
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -44,9 +44,9 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerCreateRoute(client: containerClient))
     try app.register(collection: ContainerDeleteRoute(client: containerClient))
     try app.register(collection: ContainerExportRoute())
-    try app.register(collection: ContainerInspectRoute(client: containerClient))
+    try app.register(collection: ContainerInspectRoute(client: containerClient, imageClient: imageClient))
     try app.register(collection: ContainerKillRoute(client: containerClient))
-    try app.register(collection: ContainerListRoute(client: containerClient))
+    try app.register(collection: ContainerListRoute(client: containerClient, imageClient: imageClient))
     try app.register(collection: ContainerLogsRoute(client: containerClient))
     try app.register(collection: ContainerPauseRoute())
     try app.register(collection: ContainerPruneRoute(client: containerClient))
@@ -66,8 +66,8 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ImageHistoryRoute(client: imageClient))
     try app.register(collection: ImageListRoute(client: imageClient))
     try app.register(collection: ImagePruneRoute(client: imageClient))
-    try app.register(collection: ImageCreateRoute(client: imageClient))
-    try app.register(collection: ImagePushRoute(client: imageClient))
+    try app.register(collection: ImageCreateRoute(client: imageClient, registryClient: registryClient))
+    try app.register(collection: ImagePushRoute(client: imageClient, registryClient: registryClient))
     try app.register(collection: ImageSearchRoute())
     try app.register(collection: ImageInspectRoute(client: imageClient))
     try app.register(collection: ImageTagRoute())
@@ -80,6 +80,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: VolumeInspectRoute(client: volumeClinet))
     try app.register(collection: VolumeListRoute(client: volumeClinet))
     try app.register(collection: VolumePruneRoute(client: volumeClinet))
+    try app.register(collection: VolumeUpdateRoute(client: volumeClinet))
 
     // /swarm
     try app.register(collection: SwarmInitRoute())
@@ -101,7 +102,7 @@ func configure(_ app: Application) async throws {
 
     // --- build/distribution routes ---
     try app.register(collection: BuildPruneRoute(builderClient: builderClient))
-    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient))
+    try app.register(collection: BuildRoute(client: containerClient, builderClient: builderClient, registryClient: registryClient))
     try app.register(collection: DistributionJsonRoute())
 
     // --- plugin routes ---
@@ -157,13 +158,19 @@ func configure(_ app: Application) async throws {
 
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()
+    let stoppedAttachSessionManager = StoppedContainerAttachSessionManager()
+    let execSessionManager = ExecSessionManager()
+    let startedContainerSessionManager = StartedContainerSessionManager()
     app.storage[EventBroadcasterKey.self] = broadcaster
     app.storage[AppleContainerAppSupportUrlKey.self] = appleContainerAppSupportUrl
+    app.storage[StoppedContainerAttachSessionManagerKey.self] = stoppedAttachSessionManager
+    app.storage[ExecSessionManagerKey.self] = execSessionManager
+    app.storage[StartedContainerSessionManagerKey.self] = startedContainerSessionManager
 
     let watcher = FolderWatcher(parentFolderURL: appleContainerAppSupportUrl, broadcaster: broadcaster)
     app.storage[FolderWatcherKey.self] = watcher
 
     // Await starting watching
-    watcher.startWatching()
+    await watcher.startWatching()
 
 }

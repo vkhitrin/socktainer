@@ -35,7 +35,9 @@ private struct MockHealthCheckClient: ClientHealthCheckProtocol {
         try await withRoute { app in
             try await app.testing().test(.GET, "/_ping") { res async in
                 #expect(res.headers.first(name: "Api-Version") == "1.51")
+                #expect(res.headers.first(name: "Builder-Version") == "2")
                 #expect(res.headers.first(name: "Docker-Experimental") == "false")
+                #expect(res.headers.first(name: "Swarm") == "inactive")
                 #expect(res.headers.first(name: "Cache-Control") == "no-cache, no-store, must-revalidate")
                 #expect(res.headers.first(name: "Pragma") == "no-cache")
             }
@@ -57,7 +59,11 @@ private struct MockHealthCheckClient: ClientHealthCheckProtocol {
         try await withRoute { app in
             try await app.testing().test(.HEAD, "/_ping") { res async in
                 #expect(res.headers.first(name: "Api-Version") == "1.51")
+                #expect(res.headers.first(name: "Builder-Version") == "2")
+                #expect(res.headers.first(name: "Docker-Experimental") == "false")
+                #expect(res.headers.first(name: "Swarm") == "inactive")
                 #expect(res.headers.first(name: "Cache-Control") == "no-cache, no-store, must-revalidate")
+                #expect(res.headers.first(name: "Pragma") == "no-cache")
             }
         }
     }

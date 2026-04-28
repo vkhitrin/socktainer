@@ -8,6 +8,19 @@ struct AuthRoute: RouteCollection {
 }
 
 extension AuthRoute {
+    private static func unauthorized(_ message: String) throws -> Response {
+        try jsonResponse(status: .unauthorized, message: message)
+    }
+
+    private static func jsonResponse(status: HTTPResponseStatus, message: String) throws -> Response {
+        let response = try Response(
+            status: status,
+            body: .init(data: JSONEncoder().encode(DockerErrorResponse(message: message)))
+        )
+        response.headers.replaceOrAdd(name: .contentType, value: "application/json")
+        return response
+    }
+
     static func handler(client: ClientRegistryService) -> @Sendable (Request) async throws -> Response {
         { req in
             // Collect the body for large requests
@@ -28,13 +41,12 @@ extension AuthRoute {
             do {
                 let authConfig = try req.content.decode(AuthConfig.self)
 
-                guard let username = authConfig.username, !username.isEmpty,
+                guard
+                    let username = authConfig.username, !username.isEmpty,
                     let password = authConfig.password, !password.isEmpty,
                     let serverAddress = authConfig.serveraddress, !serverAddress.isEmpty
                 else {
-                    let response = Response(status: .unauthorized, body: .init(string: "{\"message\": \"Username, password, and server address are required\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
+                    return try unauthorized("Invalid authentication payload")
                 }
 
                 let logger = req.logger
@@ -48,47 +60,41 @@ extension AuthRoute {
                         logger: logger
                     )
 
-                    let response = AuthResponse(
-                        Status: "Login Succeeded",
-                        IdentityToken: identityToken
-                    )
+                    if identityToken.isEmpty {
+                        return Response(status: .noContent)
+                    }
+
+                    let response = SystemAuthResponse(status: "Login Succeeded", identityToken: identityToken)
                     return try await response.encodeResponse(status: .ok, for: req)
 
                 } catch ClientRegistryError.invalidServerAddress {
-                    let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Invalid server address\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
+                    return try unauthorized("Invalid server address")
 
                 } catch ClientRegistryError.invalidCredentials {
-                    let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Invalid credentials format\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
+                    return try unauthorized("Invalid credentials format")
+
+                } catch ClientRegistryError.authenticationFailed(let message) {
+                    return try unauthorized(message)
 
                 } catch ClientRegistryError.storageError(let message) {
                     logger.error("Failed to store credentials: \(message)")
-                    let response = Response(status: .internalServerError, body: .init(string: "{\"message\": \"Failed to store credentials\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
+                    return try jsonResponse(status: .internalServerError, message: "Failed to store credentials")
 
                 } catch {
                     logger.error("Unexpected registry error: \(error)")
-                    let response = Response(status: .internalServerError, body: .init(string: "{\"message\": \"Internal server error\"}"))
-                    response.headers.add(name: .contentType, value: "application/json")
-                    return response
+                    return try jsonResponse(status: .internalServerError, message: "Internal server error")
                 }
 
             } catch let DecodingError.dataCorrupted(context) {
-                let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Invalid JSON: \(context.debugDescription)\"}"))
-                response.headers.add(name: .contentType, value: "application/json")
-                return response
+                return try unauthorized("Invalid JSON: \(context.debugDescription)")
             } catch let DecodingError.keyNotFound(key, _) {
-                let response = Response(status: .badRequest, body: .init(string: "{\"message\": \"Missing required field: \(key.stringValue)\"}"))
-                response.headers.add(name: .contentType, value: "application/json")
-                return response
+                return try unauthorized("Missing required field: \(key.stringValue)")
+            } catch let DecodingError.typeMismatch(_, context) {
+                return try unauthorized("Invalid JSON: \(context.debugDescription)")
+            } catch let DecodingError.valueNotFound(_, context) {
+                return try unauthorized("Invalid JSON: \(context.debugDescription)")
             } catch {
-                let response = Response(status: .internalServerError, body: .init(string: "{\"message\": \"Internal server error\"}"))
-                response.headers.add(name: .contentType, value: "application/json")
-                return response
+                return try unauthorized("Invalid authentication payload")
             }
         }
     }
